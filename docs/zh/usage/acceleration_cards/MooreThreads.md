@@ -27,6 +27,7 @@ docker run -u root --name mineru_docker \
     --shm-size=80g \
     --privileged \
     -e MTHREADS_VISIBLE_DEVICES=all \
+    -e MINERU_VLLM_DEVICE=musa \
     -e MINERU_MODEL_SOURCE=local \
     -it mineru:musa-vllm-latest \
     /bin/bash

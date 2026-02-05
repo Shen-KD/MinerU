@@ -3,42 +3,44 @@
 ```
 os: Ubuntu 22.04.5 LTS  
 cpu: Intel x86-64
-gcu: Iluvatar BI-V150
-driver: 4.4.0
-docker: 28.1.1
+xpu: P800
+driver: 515.58
+docker: 20.10.5
 ```
 
 ## 2. 环境准备
 
-### 2.1 使用 Dockerfile 构建镜像
+### 2.1 使用 Dockerfile 构建镜像 （vllm）
 
 ```bash
-wget https://gcore.jsdelivr.net/gh/opendatalab/MinerU@master/docker/china/corex.Dockerfile
-docker build --network=host -t mineru:corex-vllm-latest -f corex.Dockerfile .
+wget https://gcore.jsdelivr.net/gh/opendatalab/MinerU@master/docker/china/kxpu.Dockerfile
+docker build --network=host -t mineru:kxpu-vllm-latest -f kxpu.Dockerfile .
 ```
-
 
 ## 3. 启动 Docker 容器
 
 ```bash
-docker run --name mineru_docker \
-   -v /usr/src:/usr/src \
-   -v /lib/modules:/lib/modules \
-   -v /dev:/dev \
-   --privileged \
-   --cap-add=ALL \
-   --pid=host \
-   --group-add video \
-   --network=host \
-   --shm-size '400gb' \
-   --ulimit memlock=-1 \
-   --security-opt seccomp=unconfined \
-   --security-opt apparmor=unconfined \
-   -e VLLM_ENFORCE_CUDA_GRAPH=1 \
-   -e MINERU_MODEL_SOURCE=local \
-   -e MINERU_VLLM_DEVICE=corex \
-   -it mineru:corex-vllm-latest \
-   /bin/bash
+docker run -u root --name mineru_docker \
+    --device=/dev/xpu0:/dev/xpu0 \
+    --device=/dev/xpu1:/dev/xpu1 \
+    --device=/dev/xpu2:/dev/xpu2 \
+    --device=/dev/xpu3:/dev/xpu3 \
+    --device=/dev/xpu4:/dev/xpu4 \
+    --device=/dev/xpu5:/dev/xpu5 \
+    --device=/dev/xpu6:/dev/xpu6 \
+    --device=/dev/xpu7:/dev/xpu7 \
+    --device=/dev/xpuctrl:/dev/xpuctrl \
+    --net=host \
+    --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+    --tmpfs /dev/shm:rw,nosuid,nodev,exec,size=32g \
+    --cap-add=SYS_PTRACE \
+    -v /home/users/vllm-kunlun:/home/vllm-kunlun \
+    -v /usr/local/bin/xpu-smi:/usr/local/bin/xpu-smi \
+    -w /workspace \
+    -e MINERU_MODEL_SOURCE=local \
+    -e MINERU_VLLM_DEVICE=kxpu \
+    -it mineru:kxpu-vllm-latest \
+    /bin/bash
 ```
 
 执行该命令后，您将进入到Docker容器的交互式终端，您可以直接在容器内运行MinerU相关命令来使用MinerU的功能。
@@ -47,10 +49,10 @@ docker run --name mineru_docker \
 
 ## 4. 注意事项
 
->[!TIP]
->目前Iluvatar方案使用vllm作为推理引擎时，可能出现服务停止后显存无法正常释放的问题，如果遇到该问题，请重启Docker容器以释放显存。
+不同环境下，MinerU对Cambricon加速卡的支持情况如下表所示：
 
-不同环境下，MinerU对Iluvatar加速卡的支持情况如下表所示：
+>[!TIP]
+> - `vllm`黄灯问题为不支持`hybrid-auto-engine`模式，`vlm-auto-engine`不受影响。
 
 <table border="1">
   <thead>
@@ -70,7 +72,7 @@ docker run --name mineru_docker \
     </tr>
     <tr>
       <td>&lt;vlm/hybrid&gt;-auto-engine</td>
-      <td>🟢</td>
+      <td>🟡</td>
     </tr>
     <tr>
       <td>&lt;vlm/hybrid&gt;-http-client</td>
@@ -83,7 +85,7 @@ docker run --name mineru_docker \
     </tr>
     <tr>
       <td>&lt;vlm/hybrid&gt;-auto-engine</td>
-      <td>🟢</td>
+      <td>🟡</td>
     </tr>
     <tr>
       <td>&lt;vlm/hybrid&gt;-http-client</td>
@@ -96,7 +98,7 @@ docker run --name mineru_docker \
     </tr>
     <tr>
       <td>&lt;vlm/hybrid&gt;-auto-engine</td>
-      <td>🟢</td>
+      <td>🟡</td>
     </tr>
     <tr>
       <td>&lt;vlm/hybrid&gt;-http-client</td>
@@ -108,7 +110,7 @@ docker run --name mineru_docker \
     </tr>
     <tr>
       <td colspan="2">数据并行 (--data-parallel-size)</td>
-      <td>🟢</td>
+      <td>🔴</td>
     </tr>
   </tbody>
 </table>
@@ -119,4 +121,6 @@ docker run --name mineru_docker \
 🔴: 不支持，无法运行，或精度存在较大差异
 
 >[!TIP]
->Iluvatar加速卡指定可用加速卡的方式与NVIDIA GPU类似，请参考[使用指定GPU设备](https://opendatalab.github.io/MinerU/zh/usage/advanced_cli_parameters/#cuda_visible_devices)章节说明
+> - Kunlunxin加速卡指定可用加速卡的方式与NVIDIA GPU类似，请参考[使用指定GPU设备](https://opendatalab.github.io/MinerU/zh/usage/advanced_cli_parameters/#cuda_visible_devices)章节说明,
+>将环境变量`CUDA_VISIBLE_DEVICES`替换为`XPU_VISIBLE_DEVICES`即可。 
+> - 在Kunlunxin平台可以通过`xpu-smi`命令查看加速卡的使用情况，并根据需要指定空闲的加速卡ID以避免资源冲突。
