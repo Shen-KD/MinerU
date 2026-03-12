@@ -23,12 +23,7 @@ from ...utils.config_reader import (
 from ...utils.bbox_utils import normalize_to_int_bbox
 from ...utils.model_utils import crop_img, get_res_list_from_layout_res, clean_vram
 from ...utils.ocr_utils import merge_det_boxes, update_det_boxes, sorted_boxes
-from ...utils.ocr_utils import (
-    get_adjusted_mfdetrec_res,
-    get_ocr_result_list,
-    OcrConfidence,
-    get_rotate_crop_image_for_text_rec,
-)
+from ...utils.ocr_utils import get_adjusted_mfdetrec_res, get_ocr_result_list, OcrConfidence, get_rotate_crop_image
 from ...utils.pdf_image_tools import get_crop_np_img
 
 LAYOUT_BASE_BATCH_SIZE = 1
@@ -36,7 +31,7 @@ MFR_BASE_BATCH_SIZE = 16
 OCR_DET_BASE_BATCH_SIZE = 16
 TABLE_ORI_CLS_BATCH_SIZE = 16
 TABLE_Wired_Wireless_CLS_BATCH_SIZE = 16
-TABLE_RICH_IMAGE_LABELS = {"image", "chart"}
+TABLE_RICH_IMAGE_LABELS = {"image", "chart", "seal"}
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 TABLE_OCR_DET_DEBUG_DIR = os.path.join(PROJECT_ROOT, "output_images", "table_ocr_det_debug")
 
@@ -49,8 +44,6 @@ class BatchAnalyze:
         formula_enable,
         table_enable,
         enable_ocr_det_batch: bool = True,
-        table_ori_cls_batch_enabled: bool | None = None,
-        text_ocr_det_batch_enabled: bool | None = None,
         mask_inline_formula_for_ocr_det: bool = True,
     ):
         self.batch_ratio = batch_ratio
@@ -58,12 +51,6 @@ class BatchAnalyze:
         self.table_enable = get_table_enable(table_enable)
         self.model_manager = model_manager
         self.enable_ocr_det_batch = enable_ocr_det_batch
-        self.table_ori_cls_batch_enabled = (
-            enable_ocr_det_batch if table_ori_cls_batch_enabled is None else table_ori_cls_batch_enabled
-        )
-        self.text_ocr_det_batch_enabled = (
-            enable_ocr_det_batch if text_ocr_det_batch_enabled is None else text_ocr_det_batch_enabled
-        )
         self.mask_inline_formula_for_ocr_det = (
             get_ocr_det_mask_inline_formula_enable(mask_inline_formula_for_ocr_det)
         )
@@ -203,22 +190,6 @@ class BatchAnalyze:
             cv2.polylines(det_boxes_image, [points], isClosed=True, color=(0, 0, 255), thickness=2)
         cv2.imwrite(det_boxes_path, det_boxes_image)
 
-    @staticmethod
-    def _prune_empty_ocr_text_blocks(layout_res: list[dict], ocr_enable: bool) -> None:
-        if not ocr_enable or not layout_res:
-            return
-
-        def keep_item(item: dict) -> bool:
-            if item.get("label") != "ocr_text":
-                return True
-
-            text = item.get("text")
-            if isinstance(text, str):
-                return bool(text.strip())
-            return bool(text)
-
-        layout_res[:] = [item for item in layout_res if keep_item(item)]
-
     def _collect_table_rich_items(self, table_res_dict: dict) -> list[dict]:
         rich_items = []
         table_bbox = table_res_dict["table_res"]["bbox"]
@@ -263,41 +234,6 @@ class BatchAnalyze:
             )
 
         return rich_items
-
-    def _should_remove_table_internal_layout_item(
-        self,
-        layout_item: dict,
-        table_bbox: list[float],
-    ) -> bool:
-        label = layout_item.get("label")
-        if label not in {"display_formula", "inline_formula", *TABLE_RICH_IMAGE_LABELS}:
-            return False
-
-        item_bbox = layout_item.get("bbox")
-        if item_bbox is None:
-            return False
-
-        center = self._bbox_center(item_bbox)
-        return self._point_in_bbox(center, table_bbox, tolerance=0.5)
-
-    def _remove_table_internal_layout_items(self, table_res_list_all_page: list[dict]) -> None:
-        for table_res_dict in table_res_list_all_page:
-            table_bbox = table_res_dict["table_res"].get("bbox")
-            if table_bbox is None:
-                continue
-
-            page_layout_res = table_res_dict.get("page_layout_res")
-            if not page_layout_res:
-                continue
-
-            page_layout_res[:] = [
-                layout_item
-                for layout_item in page_layout_res
-                if not self._should_remove_table_internal_layout_item(
-                    layout_item,
-                    table_bbox,
-                )
-            ]
 
     @staticmethod
     def _match_cell_index(item_bbox: list[float], cell_bboxes: list[list[float]]) -> int | None:
@@ -488,7 +424,7 @@ class BatchAnalyze:
                 atom_model_name=AtomicModel.ImgOrientationCls,
             )
             try:
-                if self.table_ori_cls_batch_enabled:
+                if self.enable_ocr_det_batch:
                     img_orientation_cls_model.batch_predict(table_res_list_all_page,
                                                             det_batch_size=self.batch_ratio * OCR_DET_BASE_BATCH_SIZE,
                                                             batch_size=TABLE_ORI_CLS_BATCH_SIZE)
@@ -562,7 +498,7 @@ class BatchAnalyze:
                 for dt_box in dt_boxes_final:
                     rec_img_lang_group[table_res_dict["lang"]].append(
                         {
-                            "cropped_img": get_rotate_crop_image_for_text_rec(
+                            "cropped_img": get_rotate_crop_image(
                                 bgr_image, np.asarray(dt_box, dtype=np.float32)
                             ),
                             "dt_box": np.asarray(dt_box, dtype=np.float32),
@@ -593,6 +529,8 @@ class BatchAnalyze:
                         table_res_list_all_page[img_dict["table_id"]]["ocr_result"] = [
                             [img_dict["dt_box"], html.escape(ocr_res[0]), ocr_res[1]]
                         ]
+
+            clean_vram(self.model.device, vram_threshold=8)
 
             # 先对所有表格使用无线表格模型，然后对分类为有线的表格使用有线表格模型
             wireless_table_model = atom_model_manager.get_atom_model(
@@ -678,10 +616,8 @@ class BatchAnalyze:
                     end_index = html_code.rfind("</table>") + len("</table>")
                     table_res_dict["table_res"]["html"] = html_code[start_index:end_index]
 
-            self._remove_table_internal_layout_items(table_res_list_all_page)
-
         # OCR det
-        if self.text_ocr_det_batch_enabled:
+        if self.enable_ocr_det_batch:
             # 批处理模式 - 按语言和分辨率分组
             # 收集所有需要OCR检测的裁剪图像
             all_cropped_images_info = []
@@ -915,58 +851,5 @@ class BatchAnalyze:
                             page_layout_res.remove(layout_res_item)
 
                     total_processed += len(img_crop_list)
-
-        seal_ocr_items = []
-        for ocr_res_list_dict in ocr_res_list_all_page:
-            for layout_res_item in ocr_res_list_dict['layout_res']:
-                if layout_res_item.get("label") == "seal":
-                    seal_ocr_items.append((ocr_res_list_dict, layout_res_item))
-
-        seal_ocr_model = None
-        for ocr_res_list_dict, layout_res_item in tqdm(seal_ocr_items, desc="Seal Predict"):
-            np_img = ocr_res_list_dict['np_img']
-            image_h, image_w = np_img.shape[:2]
-            layout_res_item["text"] = ""
-            seal_bbox = normalize_to_int_bbox(
-                layout_res_item.get("bbox"),
-                image_size=(image_h, image_w),
-            )
-            if seal_bbox is None:
-                continue
-
-            x0, y0, x1, y1 = seal_bbox
-            seal_crop_rgb = np_img[y0:y1, x0:x1]
-            if seal_crop_rgb.size == 0:
-                continue
-
-            if seal_ocr_model is None:
-                seal_ocr_model = atom_model_manager.get_atom_model(
-                    atom_model_name=AtomicModel.OCR,
-                    lang="seal",
-                )
-
-            seal_crop_bgr = cv2.cvtColor(seal_crop_rgb, cv2.COLOR_RGB2BGR)
-            seal_ocr_res = seal_ocr_model.ocr(seal_crop_bgr, det=True, rec=True)[0]
-            if not seal_ocr_res:
-                continue
-
-            seal_texts = []
-            for seal_item in seal_ocr_res:
-                if not seal_item or len(seal_item) != 2:
-                    continue
-                rec_result = seal_item[1]
-                if not rec_result or len(rec_result) < 1:
-                    continue
-                rec_text = rec_result[0]
-                if rec_text:
-                    seal_texts.append(rec_text)
-
-            layout_res_item["text"] = seal_texts
-
-        for ocr_res_list_dict in ocr_res_list_all_page:
-            self._prune_empty_ocr_text_blocks(
-                ocr_res_list_dict["layout_res"],
-                ocr_res_list_dict["ocr_enable"],
-            )
 
         return images_layout_res
