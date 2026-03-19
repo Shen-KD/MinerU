@@ -5,6 +5,7 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
 import uuid
 import zipfile
 from contextlib import asynccontextmanager, suppress
@@ -40,9 +41,11 @@ from mineru.cli.common import (
     read_fn,
 )
 from mineru.utils.cli_parser import arg_parse
+from mineru.utils.config_reader import get_device
 from mineru.utils.guess_suffix_or_lang import guess_suffix_by_path
 from mineru.version import __version__
 
+os.environ["TORCH_CUDNN_V8_API_DISABLED"] = "1"
 log_level = os.getenv("MINERU_LOG_LEVEL", "INFO").upper()
 logger.remove()
 logger.add(sys.stderr, level=log_level)
@@ -56,9 +59,12 @@ DEFAULT_TASK_RETENTION_SECONDS = 24 * 60 * 60
 DEFAULT_TASK_CLEANUP_INTERVAL_SECONDS = 5 * 60
 DEFAULT_OUTPUT_ROOT = "./output"
 ALLOWED_PARSE_METHODS = {"auto", "txt", "ocr"}
+DEFAULT_MAX_CONCURRENT_REQUESTS = 3
 
 # 并发控制器
 _request_semaphore: Optional[asyncio.Semaphore] = None
+_configured_max_concurrent_requests = 0
+_mps_parse_lock = threading.Lock()
 
 
 @dataclass
@@ -161,17 +167,21 @@ def create_app():
         lifespan=lifespan,
     )
 
-    global _request_semaphore
+    global _request_semaphore, _configured_max_concurrent_requests
     try:
         max_concurrent_requests = int(
-            os.getenv("MINERU_API_MAX_CONCURRENT_REQUESTS", "0")
+            os.getenv("MINERU_API_MAX_CONCURRENT_REQUESTS", f"{DEFAULT_MAX_CONCURRENT_REQUESTS}")
         )
     except ValueError:
-        max_concurrent_requests = 0
+        max_concurrent_requests = DEFAULT_MAX_CONCURRENT_REQUESTS
 
+    _configured_max_concurrent_requests = max_concurrent_requests
+    app.state.max_concurrent_requests = max_concurrent_requests
     if max_concurrent_requests > 0:
         _request_semaphore = asyncio.Semaphore(max_concurrent_requests)
         logger.info(f"Request concurrency limited to {max_concurrent_requests}")
+    else:
+        _request_semaphore = None
 
     app.add_middleware(GZipMiddleware, minimum_size=1000)
     return app
@@ -195,9 +205,7 @@ def get_int_env(name: str, default: int, minimum: int = 0) -> int:
 
 
 def get_max_concurrent_requests() -> int:
-    if _request_semaphore is None:
-        return 0
-    return get_int_env("MINERU_API_MAX_CONCURRENT_REQUESTS", 0)
+    return _configured_max_concurrent_requests
 
 
 def get_task_retention_seconds() -> int:
@@ -654,10 +662,30 @@ async def run_parse_job(
     )
 
     if request_options.backend == "pipeline":
-        await asyncio.to_thread(do_parse, **parse_kwargs)
+        async with serialize_parse_job_if_needed(request_options.backend):
+            await asyncio.to_thread(do_parse, **parse_kwargs)
     else:
-        await aio_do_parse(**parse_kwargs)
+        async with serialize_parse_job_if_needed(request_options.backend):
+            await aio_do_parse(**parse_kwargs)
     return response_file_names
+
+
+def should_serialize_parse_job(backend: str) -> bool:
+    if get_device() != "mps":
+        return False
+    return backend == "pipeline" or backend.startswith(("vlm-", "hybrid-"))
+
+
+@asynccontextmanager
+async def serialize_parse_job_if_needed(backend: str):
+    if not should_serialize_parse_job(backend):
+        yield
+        return
+    await asyncio.to_thread(_mps_parse_lock.acquire)
+    try:
+        yield
+    finally:
+        _mps_parse_lock.release()
 
 
 def create_task_output_dir(task_id: str) -> str:
@@ -919,7 +947,7 @@ def get_task_manager() -> AsyncTaskManager:
     return task_manager
 
 
-@app.post(path="/file_parse", status_code=202)
+@app.post(path="/file_parse", status_code=202, include_in_schema=False)
 async def parse_pdf(
     http_request: Request,
     request_options: ParseRequestOptions = Depends(parse_request_form),
@@ -1042,15 +1070,24 @@ def main(ctx, host, port, reload, **kwargs):
     app.state.config = kwargs
 
     try:
-        mcr = int(kwargs.get("mineru_api_max_concurrent_requests", 0) or 0)
+        mcr = int(
+            kwargs.get(
+                "mineru_api_max_concurrent_requests",
+                DEFAULT_MAX_CONCURRENT_REQUESTS,
+            )
+            or DEFAULT_MAX_CONCURRENT_REQUESTS
+        )
     except ValueError:
-        mcr = 0
+        mcr = DEFAULT_MAX_CONCURRENT_REQUESTS
     os.environ["MINERU_API_MAX_CONCURRENT_REQUESTS"] = str(mcr)
 
     print(f"Start MinerU FastAPI Service: http://{host}:{port}")
     print(f"API documentation: http://{host}:{port}/docs")
 
-    uvicorn.run("mineru.cli.fast_api:app", host=host, port=port, reload=reload)
+    if reload:
+        uvicorn.run("mineru.cli.fast_api:app", host=host, port=port, reload=True)
+    else:
+        uvicorn.run(app, host=host, port=port, reload=False)
 
 
 if __name__ == "__main__":
