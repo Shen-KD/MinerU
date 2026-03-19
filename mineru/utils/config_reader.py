@@ -98,7 +98,12 @@ def get_device():
                             if torch.mlu.is_available():
                                 return "mlu"
                         except Exception as e:
-                            pass
+                            try:
+                                if torch.sdaa.is_available():
+                                    return "sdaa"
+                            except Exception as e:
+                                pass
+                                                           
         return "cpu"
 
 
@@ -112,6 +117,28 @@ def get_table_enable(table_enable):
     table_enable_env = os.getenv('MINERU_TABLE_ENABLE')
     table_enable = table_enable if table_enable_env is None else table_enable_env.lower() == 'true'
     return table_enable
+
+
+def get_ocr_det_mask_inline_formula_enable(enable):
+    enable_env = os.getenv('MINERU_OCR_DET_MASK_INLINE_FORMULA_ENABLE')
+    enable = enable if enable_env is None else enable_env.lower() == 'true'
+    return enable
+
+
+def is_low_memory_enabled() -> bool:
+    return os.getenv('MINERU_LOW_MEMORY', 'false').lower() in ('1', 'true', 'yes')
+
+
+def get_low_memory_window_size(default: int = 64) -> int:
+    value = os.getenv('MINERU_LOW_MEMORY_WINDOW_SIZE')
+    if value is None:
+        return default
+    try:
+        window_size = int(value)
+    except ValueError:
+        logger.warning(f"Invalid MINERU_LOW_MEMORY_WINDOW_SIZE value: {value}, use default {default}")
+        return default
+    return max(1, window_size)
 
 
 def get_latex_delimiter_config():
