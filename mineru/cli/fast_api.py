@@ -39,6 +39,7 @@ from mineru.cli.common import (
     office_suffixes,
     pdf_suffixes,
     read_fn,
+    uniquify_task_stems,
 )
 from mineru.cli.api_protocol import (
     API_PROTOCOL_VERSION,
@@ -132,6 +133,7 @@ class AsyncParseTask:
     return_original_file: bool
     start_page_id: int
     end_page_id: int
+    upload_names: list[str]
     uploads: list[str]
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
@@ -283,6 +285,21 @@ def cleanup_file(file_path: str) -> None:
                 shutil.rmtree(file_path)
     except Exception as e:
         logger.warning(f"fail clean file {file_path}: {e}")
+
+
+def build_upload_destination(upload_dir: str, filename: str) -> Path:
+    destination = Path(upload_dir) / filename
+    if not destination.exists():
+        return destination
+
+    base_name = Path(filename).stem
+    suffix = Path(filename).suffix
+    index = 2
+    while True:
+        candidate = Path(upload_dir) / f"{base_name}__upload_{index}{suffix}"
+        if not candidate.exists():
+            return candidate
+        index += 1
 
 
 def encode_image(image_path: str) -> str:
@@ -724,7 +741,7 @@ async def save_upload_files(upload_dir: str, files: list[UploadFile]) -> list[St
     for upload in files:
         original_name = upload.filename or f"upload-{uuid.uuid4()}"
         filename = Path(original_name).name
-        destination = Path(upload_dir) / filename
+        destination = build_upload_destination(upload_dir, filename)
         try:
             with open(destination, "wb") as handle:
                 while True:
@@ -753,6 +770,27 @@ async def save_upload_files(upload_dir: str, files: list[UploadFile]) -> list[St
             raise
         finally:
             await upload.close()
+
+    normalized_stems, renamed_stems = uniquify_task_stems(
+        [upload.stem for upload in uploads]
+    )
+    if renamed_stems:
+        rename_details = ", ".join(
+            f"{Path(upload.original_name).name} -> {effective_stem}"
+            for upload, effective_stem in zip(uploads, normalized_stems)
+            if upload.stem != effective_stem
+        )
+        logger.warning(
+            f"Normalized duplicate upload stems within request: {rename_details}"
+        )
+        uploads = [
+            StoredUpload(
+                original_name=upload.original_name,
+                stem=effective_stem,
+                path=upload.path,
+            )
+            for upload, effective_stem in zip(uploads, normalized_stems)
+        ]
     return uploads
 
 
@@ -871,6 +909,7 @@ async def create_async_parse_task(
             return_original_file=request_options.return_original_file,
             start_page_id=request_options.start_page_id,
             end_page_id=request_options.end_page_id,
+            upload_names=[upload.original_name for upload in uploads],
             uploads=[upload.path for upload in uploads],
         )
         await task_manager.submit(task)
@@ -1090,11 +1129,15 @@ class AsyncTaskManager:
 
         uploads = [
             StoredUpload(
-                original_name=Path(upload_path).name,
-                stem=Path(upload_path).stem,
+                original_name=upload_name,
+                stem=file_name,
                 path=upload_path,
             )
-            for upload_path in task.uploads
+            for upload_name, file_name, upload_path in zip(
+                task.upload_names,
+                task.file_names,
+                task.uploads,
+            )
         ]
         config = getattr(self.app.state, "config", {})
         await run_parse_job(

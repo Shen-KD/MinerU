@@ -1,16 +1,14 @@
 # Copyright (c) Opendatalab. All rights reserved.
-import io
 import json
 import os
-import copy
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Sequence
 
 from loguru import logger
-import pypdfium2 as pdfium
 
 from mineru.data.data_reader_writer import FileBasedDataWriter
-from mineru.utils.draw_bbox import draw_layout_bbox, draw_span_bbox, draw_line_sort_bbox
+from mineru.utils.draw_bbox import draw_layout_bbox, draw_span_bbox
 from mineru.utils.engine_utils import get_vlm_engine
 from mineru.utils.enum_class import MakeMode
 from mineru.utils.guess_suffix_or_lang import guess_suffix_by_bytes
@@ -20,8 +18,9 @@ from mineru.backend.office.office_middle_json_mkcontent import union_make as off
 from mineru.backend.vlm.vlm_analyze import doc_analyze as vlm_doc_analyze
 from mineru.backend.vlm.vlm_analyze import aio_doc_analyze as aio_vlm_doc_analyze
 from mineru.backend.office.docx_analyze import office_docx_analyze
-from mineru.utils.pdf_page_id import get_end_page_id
+from mineru.utils.pdfium_guard import rewrite_pdf_bytes_with_pdfium
 
+os.environ["TORCH_CUDNN_V8_API_DISABLED"] = "1"
 if os.getenv("MINERU_LMDEPLOY_DEVICE", "") == "maca":
     import torch
     torch.backends.cudnn.enabled = False
@@ -36,12 +35,49 @@ office_suffixes = docx_suffixes + pptx_suffixes + xlsx_suffixes
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-def read_fn(path):
+
+def uniquify_task_stems(
+    stems: Sequence[str],
+) -> tuple[list[str], list[tuple[str, str]]]:
+    """Assign task-local unique stems while preserving input order."""
+    raw_keys = {stem.casefold() for stem in stems}
+    occurrence_counts: dict[str, int] = {}
+    assigned_keys: set[str] = set()
+    unique_stems: list[str] = []
+    renamed: list[tuple[str, str]] = []
+
+    for stem in stems:
+        stem_key = stem.casefold()
+        seen_count = occurrence_counts.get(stem_key, 0)
+        occurrence_counts[stem_key] = seen_count + 1
+
+        if seen_count == 0 and stem_key not in assigned_keys:
+            effective_stem = stem
+        else:
+            suffix = seen_count + 1
+            while True:
+                candidate = f"{stem}_{suffix}"
+                candidate_key = candidate.casefold()
+                if candidate_key not in raw_keys and candidate_key not in assigned_keys:
+                    effective_stem = candidate
+                    break
+                suffix += 1
+
+        assigned_keys.add(effective_stem.casefold())
+        unique_stems.append(effective_stem)
+        if effective_stem != stem:
+            renamed.append((stem, effective_stem))
+
+    return unique_stems, renamed
+
+
+def read_fn(path, file_suffix: str | None = None):
     if not isinstance(path, Path):
         path = Path(path)
     with open(str(path), "rb") as input_file:
         file_bytes = input_file.read()
-        file_suffix = guess_suffix_by_bytes(file_bytes, path)
+        if file_suffix is None:
+            file_suffix = guess_suffix_by_bytes(file_bytes, path)
         if file_suffix in image_suffixes:
             return images_bytes_to_pdf_bytes(file_bytes)
         elif file_suffix in pdf_suffixes + office_suffixes:
@@ -58,42 +94,29 @@ def prepare_env(output_dir, pdf_file_name, parse_method):
     return local_image_dir, local_md_dir
 
 
-def convert_pdf_bytes_to_bytes_by_pypdfium2(pdf_bytes, start_page_id=0, end_page_id=None):
-    pdf = pdfium.PdfDocument(pdf_bytes)
-    output_pdf = pdfium.PdfDocument.new()
+def convert_pdf_bytes_to_bytes(pdf_bytes, start_page_id=0, end_page_id=None):
     try:
-        end_page_id = get_end_page_id(end_page_id, len(pdf))
-
-        # 逐页导入,失败则跳过
-        output_index = 0
-        for page_index in range(start_page_id, end_page_id + 1):
-            try:
-                output_pdf.import_pages(pdf, pages=[page_index])
-                output_index += 1
-            except Exception as page_error:
-                output_pdf.del_page(output_index)
-                logger.warning(f"Failed to import page {page_index}: {page_error}, skipping this page.")
-                continue
-
-        # 将新PDF保存到内存缓冲区
-        output_buffer = io.BytesIO()
-        output_pdf.save(output_buffer)
-
-        # 获取字节数据
-        output_bytes = output_buffer.getvalue()
-    except Exception as e:
-        logger.warning(f"Error in converting PDF bytes: {e}, Using original PDF bytes.")
-        output_bytes = pdf_bytes
-    pdf.close()
-    output_pdf.close()
-    return output_bytes
+        rebuilt_pdf_bytes = rewrite_pdf_bytes_with_pdfium(
+            pdf_bytes,
+            start_page_id=start_page_id,
+            end_page_id=end_page_id,
+        )
+        if rebuilt_pdf_bytes:
+            return rebuilt_pdf_bytes
+        logger.warning("PDFium rewrite returned empty bytes, using original PDF bytes.")
+    except Exception as fallback_error:
+        logger.warning(
+            f"Error in converting PDF bytes with pdfium: {fallback_error}, "
+            "using original PDF bytes."
+        )
+    return pdf_bytes
 
 
 def _prepare_pdf_bytes(pdf_bytes_list, start_page_id, end_page_id):
     """准备处理PDF字节数据"""
     result = []
     for pdf_bytes in pdf_bytes_list:
-        new_pdf_bytes = convert_pdf_bytes_to_bytes_by_pypdfium2(pdf_bytes, start_page_id, end_page_id)
+        new_pdf_bytes = convert_pdf_bytes_to_bytes(pdf_bytes, start_page_id, end_page_id)
         result.append(new_pdf_bytes)
     return result
 
@@ -117,7 +140,6 @@ def _process_output(
         model_output=None,
         process_mode="vlm",
 ):
-    f_draw_line_sort_bbox = False
     from mineru.backend.pipeline.pipeline_middle_json_mkcontent import union_make as pipeline_union_make
     if process_mode == "pipeline":
         make_func = pipeline_union_make
@@ -129,10 +151,16 @@ def _process_output(
         raise Exception(f"Unknown process_mode: {process_mode}")
     """处理输出文件"""
     if f_draw_layout_bbox:
-        draw_layout_bbox(pdf_info, pdf_bytes, local_md_dir, f"{pdf_file_name}_layout.pdf")
+        try:
+            draw_layout_bbox(pdf_info, pdf_bytes, local_md_dir, f"{pdf_file_name}_layout.pdf")
+        except Exception as exc:
+            logger.warning(f"Skipping layout bbox visualization for {pdf_file_name}: {exc}")
 
     if f_draw_span_bbox:
-        draw_span_bbox(pdf_info, pdf_bytes, local_md_dir, f"{pdf_file_name}_span.pdf")
+        try:
+            draw_span_bbox(pdf_info, pdf_bytes, local_md_dir, f"{pdf_file_name}_span.pdf")
+        except Exception as exc:
+            logger.warning(f"Skipping span bbox visualization for {pdf_file_name}: {exc}")
 
     if f_dump_orig_pdf:
         if process_mode in ["pipeline", "vlm"]:
@@ -146,9 +174,6 @@ def _process_output(
                 pdf_bytes,
             )
 
-    if f_draw_line_sort_bbox:
-        draw_line_sort_bbox(pdf_info, pdf_bytes, local_md_dir, f"{pdf_file_name}_line_sort.pdf")
-
     image_dir = str(os.path.basename(local_image_dir))
 
     if f_dump_md:
@@ -159,17 +184,18 @@ def _process_output(
         )
 
     if f_dump_content_list:
+
         content_list = make_func(pdf_info, MakeMode.CONTENT_LIST, image_dir)
         md_writer.write_string(
             f"{pdf_file_name}_content_list.json",
             json.dumps(content_list, ensure_ascii=False, indent=4),
         )
-        if process_mode != "pipeline":
-            content_list_v2 = make_func(pdf_info, MakeMode.CONTENT_LIST_V2, image_dir)
-            md_writer.write_string(
-                f"{pdf_file_name}_content_list_v2.json",
-                json.dumps(content_list_v2, ensure_ascii=False, indent=4),
-            )
+
+        content_list_v2 = make_func(pdf_info, MakeMode.CONTENT_LIST_V2, image_dir)
+        md_writer.write_string(
+            f"{pdf_file_name}_content_list_v2.json",
+            json.dumps(content_list_v2, ensure_ascii=False, indent=4),
+        )
 
 
     if f_dump_middle_json:
@@ -224,7 +250,7 @@ def _process_pipeline(
         pdf_file_name, local_image_dir, local_md_dir = local_output_info[doc_index]
         md_writer = md_writer_list[doc_index]
         pdf_bytes = pdf_bytes_list[doc_index]
-        logger.info(f"Pipeline output start: doc{doc_index}")
+        logger.debug(f"Pipeline output start: doc{doc_index}")
         try:
             _process_output(
                 middle_json["pdf_info"], pdf_bytes, pdf_file_name, local_md_dir, local_image_dir,
@@ -232,14 +258,14 @@ def _process_pipeline(
                 f_dump_md, f_dump_content_list, f_dump_middle_json, f_dump_model_output,
                 f_make_md_mode, middle_json, model_list, process_mode="pipeline"
             )
-            logger.info(f"Pipeline output complete: doc{doc_index}")
+            logger.debug(f"Pipeline output complete: doc{doc_index}")
         except Exception:
             logger.exception(f"Pipeline output failed: doc{doc_index}")
             raise
 
     with ThreadPoolExecutor(max_workers=1) as output_executor:
         def on_doc_ready(doc_index, model_list, middle_json, ocr_enable):
-            logger.info(
+            logger.debug(
                 f"Pipeline doc ready: doc{doc_index} pages={len(middle_json['pdf_info'])} output_submitted=1"
             )
             future = output_executor.submit(run_output_task, doc_index, middle_json, model_list)

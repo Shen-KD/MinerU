@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import zipfile
+from concurrent.futures import Future, ProcessPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -33,7 +34,17 @@ from mineru.utils.pdfium_guard import (
 )
 
 from ..version import __version__
-from .common import image_suffixes, office_suffixes, pdf_suffixes
+from .common import (
+    image_suffixes,
+    office_suffixes,
+    pdf_suffixes,
+    uniquify_task_stems,
+)
+from .output_paths import resolve_parse_dir
+from .visualization import (
+    VisualizationJob,
+    run_visualization_job,
+)
 
 os.environ["TORCH_CUDNN_V8_API_DISABLED"] = "1"
 log_level = os.getenv("MINERU_LOG_LEVEL", "INFO").upper()
@@ -73,6 +84,12 @@ class TaskExecutionProgress:
     completed_tasks: int
     completed_pages: int
     lock: asyncio.Lock
+
+
+@dataclass
+class VisualizationContext:
+    executor: ProcessPoolExecutor
+    futures: list[Future]
 
 
 @dataclass(frozen=True)
@@ -264,6 +281,106 @@ async def mark_task_completed(
         return progress.completed_tasks, progress.completed_pages
 
 
+def create_visualization_context() -> Optional[VisualizationContext]:
+    try:
+        return VisualizationContext(
+            executor=ProcessPoolExecutor(max_workers=1),
+            futures=[],
+        )
+    except Exception as exc:
+        logger.warning(f"Failed to start visualization worker process: {exc}")
+        return None
+
+
+def build_visualization_jobs(
+    planned_task: PlannedTask,
+    output_dir: Path,
+    backend: str,
+    parse_method: str,
+) -> list[VisualizationJob]:
+    draw_span = backend.startswith("pipeline")
+    return [
+        VisualizationJob(
+            document_stem=document.stem,
+            backend=backend,
+            parse_method=parse_method,
+            parse_dir=resolve_parse_dir(
+                output_dir,
+                document.stem,
+                backend,
+                parse_method,
+                is_office=document.suffix in office_suffixes,
+            ),
+            draw_span=draw_span,
+        )
+        for document in planned_task.documents
+    ]
+
+
+def log_visualization_future_result(
+    job: VisualizationJob,
+    future: Future,
+) -> None:
+    try:
+        result = future.result()
+    except Exception as exc:
+        logger.warning(f"Skipping visualization for {job.document_stem}: {exc}")
+        return
+
+    if result.status != "finished":
+        logger.warning(
+            f"Skipping visualization for {result.document_stem}: {result.message}"
+        )
+
+
+def queue_visualization_jobs(
+    visualization_context: Optional[VisualizationContext],
+    jobs: list[VisualizationJob],
+    planned_task: PlannedTask,
+) -> int:
+    if visualization_context is None or not jobs:
+        return 0
+
+    del planned_task
+    queued_jobs = 0
+    for job in jobs:
+        try:
+            future = visualization_context.executor.submit(run_visualization_job, job)
+        except Exception as exc:
+            logger.warning(f"Skipping visualization for {job.document_stem}: {exc}")
+            continue
+
+        future.add_done_callback(
+            lambda completed_future, job=job: log_visualization_future_result(
+                job,
+                completed_future,
+            )
+        )
+        visualization_context.futures.append(future)
+        queued_jobs += 1
+
+    return queued_jobs
+
+
+async def wait_for_visualization_jobs(
+    visualization_context: Optional[VisualizationContext],
+) -> None:
+    if visualization_context is None:
+        return
+
+    try:
+        if visualization_context.futures:
+            await asyncio.gather(
+                *(
+                    asyncio.wrap_future(future)
+                    for future in visualization_context.futures
+                ),
+                return_exceptions=True,
+            )
+    finally:
+        visualization_context.executor.shutdown(wait=True)
+
+
 def response_detail(response: httpx.Response) -> str:
     try:
         payload = response.json()
@@ -420,20 +537,28 @@ def collect_input_documents(
     if not collected:
         raise click.ClickException(f"No supported documents found under {input_path}")
 
-    stem_to_paths: dict[str, list[Path]] = {}
-    for document in collected:
-        stem_to_paths.setdefault(document.stem, []).append(document.path)
-    duplicate_stems = {
-        stem: paths for stem, paths in stem_to_paths.items() if len(paths) > 1
-    }
-    if duplicate_stems:
-        details = "; ".join(
-            f"{stem}: {', '.join(str(path) for path in paths)}"
-            for stem, paths in sorted(duplicate_stems.items())
+    normalized_stems, renamed_stems = uniquify_task_stems(
+        [document.stem for document in collected]
+    )
+    if renamed_stems:
+        rename_details = ", ".join(
+            f"{document.path.name} -> {effective_stem}"
+            for document, effective_stem in zip(collected, normalized_stems)
+            if document.stem != effective_stem
         )
-        raise click.ClickException(
-            f"Duplicate output stems detected. Rename inputs to avoid collisions: {details}"
+        logger.warning(
+            f"Normalized duplicate document stems within this run: {rename_details}"
         )
+        return [
+            InputDocument(
+                path=document.path,
+                suffix=document.suffix,
+                stem=effective_stem,
+                effective_pages=document.effective_pages,
+                order=document.order,
+            )
+            for document, effective_stem in zip(collected, normalized_stems)
+        ]
 
     return collected
 
@@ -726,6 +851,9 @@ async def run_planned_task(
     server_health: ServerHealth,
     planned_task: PlannedTask,
     progress: TaskExecutionProgress,
+    backend: str,
+    parse_method: str,
+    visualization_context: Optional[VisualizationContext],
     form_data: dict[str, str],
     output_dir: Path,
 ) -> None:
@@ -762,6 +890,23 @@ async def run_planned_task(
             completed_pages,
         )
     )
+    try:
+        visualization_jobs = build_visualization_jobs(
+            planned_task,
+            output_dir,
+            backend,
+            parse_method,
+        )
+    except Exception as exc:
+        logger.warning(
+            f"Skipping visualization for {format_task_log_label(planned_task)}: {exc}"
+        )
+    else:
+        queue_visualization_jobs(
+            visualization_context,
+            visualization_jobs,
+            planned_task,
+        )
 
 
 async def run_orchestrated_cli(
@@ -791,6 +936,7 @@ async def run_orchestrated_cli(
 
     timeout = build_http_timeout()
     local_server: LocalAPIServer | None = None
+    visualization_context: Optional[VisualizationContext] = None
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as http_client:
         try:
             if api_url is None:
@@ -826,6 +972,7 @@ async def run_orchestrated_cli(
                 start_page_id=start_page_id,
                 end_page_id=end_page_id,
             )
+            visualization_context = create_visualization_context()
             failures = await execute_planned_tasks(
                 planned_tasks=planned_tasks,
                 concurrency=concurrency,
@@ -834,6 +981,9 @@ async def run_orchestrated_cli(
                     server_health=server_health,
                     planned_task=planned_task,
                     progress=progress,
+                    backend=backend,
+                    parse_method=method,
+                    visualization_context=visualization_context,
                     form_data=form_data,
                     output_dir=output_dir,
                 ),
@@ -847,8 +997,11 @@ async def run_orchestrated_cli(
                     f"{len(failures)} task(s) failed while processing documents:\n{details}"
                 )
         finally:
-            if local_server is not None:
-                local_server.stop()
+            try:
+                if local_server is not None:
+                    local_server.stop()
+            finally:
+                await wait_for_visualization_jobs(visualization_context)
 
 
 @click.command()
