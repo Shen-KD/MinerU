@@ -8,6 +8,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -44,6 +45,9 @@ TASKS_ENDPOINT = "/tasks"
 TASK_STATUS_POLL_INTERVAL_SECONDS = 1.0
 TASK_RESULT_TIMEOUT_SECONDS = 600
 LOCAL_API_STARTUP_TIMEOUT_SECONDS = 30
+LOCAL_API_CLEANUP_RETRIES = 8
+LOCAL_API_CLEANUP_RETRY_INTERVAL_SECONDS = 0.25
+LOCAL_API_MAX_CONCURRENT_REQUESTS = 1
 
 
 @dataclass(frozen=True)
@@ -92,12 +96,9 @@ class LocalAPIServer:
         self.temp_dir = tempfile.TemporaryDirectory(prefix="mineru-api-client-")
         self.temp_root = Path(self.temp_dir.name)
         self.output_root = self.temp_root / "output"
-        self.log_path = self.temp_root / "mineru-api.log"
         self.base_url: str | None = None
         self.process: subprocess.Popen[bytes] | None = None
-        self._log_handle = None
         self._atexit_registered = False
-        self._cleanup_enabled = True
 
     def start(self) -> str:
         if self.process is not None:
@@ -107,9 +108,12 @@ class LocalAPIServer:
         self.base_url = f"http://127.0.0.1:{port}"
         env = os.environ.copy()
         env["MINERU_API_OUTPUT_ROOT"] = str(self.output_root)
+        env["MINERU_API_MAX_CONCURRENT_REQUESTS"] = str(
+            LOCAL_API_MAX_CONCURRENT_REQUESTS
+        )
+        env["MINERU_API_DISABLE_ACCESS_LOG"] = "1"
         self.output_root.mkdir(parents=True, exist_ok=True)
 
-        self._log_handle = open(self.log_path, "wb")
         self.process = subprocess.Popen(
             [
                 sys.executable,
@@ -120,8 +124,6 @@ class LocalAPIServer:
                 "--port",
                 str(port),
             ],
-            stdout=self._log_handle,
-            stderr=subprocess.STDOUT,
             cwd=os.getcwd(),
             env=env,
         )
@@ -131,8 +133,7 @@ class LocalAPIServer:
             self._atexit_registered = True
         return self.base_url
 
-    def stop(self, preserve_logs: bool = False) -> None:
-        self._cleanup_enabled = not preserve_logs
+    def stop(self) -> None:
         process = self.process
         self.process = None
         try:
@@ -144,26 +145,34 @@ class LocalAPIServer:
                     process.kill()
                     process.wait(timeout=5)
         finally:
-            if self._log_handle is not None:
-                self._log_handle.close()
-                self._log_handle = None
             if self._atexit_registered:
                 try:
                     atexit.unregister(self.stop)
                 except Exception:
                     pass
                 self._atexit_registered = False
-            if self._cleanup_enabled:
+            self._cleanup_temp_dir()
+
+    def _cleanup_temp_dir(self) -> None:
+        last_error: Exception | None = None
+        for attempt in range(LOCAL_API_CLEANUP_RETRIES):
+            try:
                 self.temp_dir.cleanup()
+                return
+            except FileNotFoundError:
+                return
+            except Exception as exc:
+                last_error = exc
+                if attempt + 1 < LOCAL_API_CLEANUP_RETRIES:
+                    time.sleep(LOCAL_API_CLEANUP_RETRY_INTERVAL_SECONDS)
 
-    def read_log_tail(self, max_chars: int = 4000) -> str:
-        if not self.log_path.exists():
-            return ""
-        content = self.log_path.read_text(encoding="utf-8", errors="ignore")
-        if len(content) <= max_chars:
-            return content
-        return content[-max_chars:]
-
+        if last_error is not None:
+            logger.warning(
+                "Failed to clean up temporary MinerU API directory {}: {}. "
+                "You can remove it manually after processes release any open handles.",
+                self.temp_root,
+                last_error,
+            )
 
 def find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -258,10 +267,8 @@ async def wait_for_local_api_ready(
     while asyncio.get_running_loop().time() < deadline:
         process = local_server.process
         if process is not None and process.poll() is not None:
-            log_tail = local_server.read_log_tail()
             raise click.ClickException(
-                f"Local mineru-api exited before becoming healthy. "
-                f"Log file: {local_server.log_path}\n{log_tail}"
+                "Local mineru-api exited before becoming healthy."
             )
         try:
             return await fetch_server_health(client, local_server.base_url)
@@ -271,11 +278,10 @@ async def wait_for_local_api_ready(
             last_error = str(exc)
         await asyncio.sleep(TASK_STATUS_POLL_INTERVAL_SECONDS)
 
-    log_tail = local_server.read_log_tail()
-    raise click.ClickException(
-        f"Timed out waiting for local mineru-api to become healthy. "
-        f"Log file: {local_server.log_path}\n{last_error or ''}\n{log_tail}"
-    )
+    message = "Timed out waiting for local mineru-api to become healthy."
+    if last_error:
+        message = f"{message} {last_error}"
+    raise click.ClickException(message)
 
 
 def probe_pdf_effective_pages(
@@ -756,8 +762,7 @@ async def run_orchestrated_cli(
                 )
         finally:
             if local_server is not None:
-                preserve_logs = sys.exc_info()[0] is not None
-                local_server.stop(preserve_logs=preserve_logs)
+                local_server.stop()
 
 
 @click.command()
