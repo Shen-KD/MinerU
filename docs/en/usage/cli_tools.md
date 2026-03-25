@@ -10,20 +10,17 @@ Options:
   -v, --version                   Show version and exit
   -p, --path PATH                 Input file path or directory (required)
   -o, --output PATH               Output directory (required)
+  --api-url TEXT                  MinerU FastAPI base URL; if omitted, `mineru` starts a temporary local `mineru-api`
   -m, --method [auto|txt|ocr]     Parsing method: auto (default), txt, ocr (pipeline and hybrid* backend only)
   -b, --backend [pipeline|hybrid-auto-engine|hybrid-http-client|vlm-auto-engine|vlm-http-client]
                                   Parsing backend (default: hybrid-auto-engine)
   -l, --lang [ch|ch_server|ch_lite|en|korean|japan|chinese_cht|ta|te|ka|th|el|latin|arabic|east_slavic|cyrillic|devanagari]
                                   Specify document language (improves OCR accuracy, pipeline and hybrid* backend only)
-  -u, --url TEXT                  Service address when using http-client
+  -u, --url TEXT                  OpenAI-compatible backend URL passed through to the server when using http-client
   -s, --start INTEGER             Starting page number for parsing (0-based)
   -e, --end INTEGER               Ending page number for parsing (0-based)
   -f, --formula BOOLEAN           Enable formula parsing (default: enabled)
   -t, --table BOOLEAN             Enable table parsing (default: enabled)
-  -d, --device TEXT               Inference device (e.g., cpu/cuda/cuda:0/npu/mps, pipeline and vlm-transformers backend only)
-  --vram INTEGER                  Maximum GPU VRAM usage per process (GB) (pipeline backend only)
-  --source [huggingface|modelscope|local]
-                                  Model source, default: huggingface
   --help                          Show help information
 ```
 ```bash
@@ -62,22 +59,14 @@ Options:
 
 ## Environment Variables Description
 
+> [!NOTE]
+> Starting from this version, `mineru` is an orchestration client built on top of `mineru-api`:
+> - Without `--api-url`, the CLI launches a temporary local `mineru-api`
+> - With `--api-url`, the CLI connects to that FastAPI service directly
+> - `--url` is no longer the MinerU API address; it is the OpenAI-compatible backend URL used by server-side `vlm/hybrid-http-client`
+
 Some parameters of MinerU command line tools have equivalent environment variable configurations. Generally, environment variable configurations have higher priority than command line parameters and take effect across all command line tools.
 Here are the environment variables and their descriptions:
-
-- `MINERU_DEVICE_MODE`:
-    * Used to specify inference device
-    * supports device types like `cpu/cuda/cuda:0/npu/mps`
-    * only effective for `pipeline` and `vlm-transformers` backends.
-  
-- `MINERU_VIRTUAL_VRAM_SIZE`: 
-    * Used to specify maximum GPU VRAM usage per process (GB)
-    * only effective for `pipeline` backend.
-  
-- `MINERU_MODEL_SOURCE`: 
-    * Used to specify model source
-    * supports `huggingface/modelscope/local`
-    * defaults to `huggingface`, can be switched to `modelscope` or local models through environment variables.
   
 - `MINERU_TOOLS_CONFIG_JSON`: 
     * Used to specify configuration file path
@@ -101,8 +90,14 @@ Here are the environment variables and their descriptions:
     * Default is `true`, can be set to `false` via environment variable to disable table merging functionality.
 
 - `MINERU_PDF_RENDER_TIMEOUT`:
-    * Used to set the timeout period (in seconds) for rendering PDF to images
-    * Default is `300` seconds, can be set to other values via environment variable to adjust the image rendering timeout.
+    * Used to set the timeout (in seconds) for rendering PDFs to images.
+    * Default is `300` seconds; you can set a different value via an environment variable to adjust the rendering timeout.
+    * Only effective on Linux and macOS systems.
+
+- `MINERU_PDF_RENDER_THREADS`:
+    * Used to set the number of threads used when rendering PDFs to images.
+    * Default is `4`; you can set a different value via an environment variable to adjust the number of threads for image rendering.
+    * Only effective on Linux and macOS systems.
 
 - `MINERU_INTRA_OP_NUM_THREADS`:
     * Used to set the intra_op thread count for ONNX models, affects the computation speed of individual operators
