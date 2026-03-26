@@ -11,7 +11,9 @@ import time
 import uuid
 import zipfile
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 import click
 import gradio as gr
@@ -41,36 +43,255 @@ from mineru.cli.visualization import VisualizationJob, run_visualization_job
 _gradio_local_api_server = _api_client.ReusableLocalAPIServer()
 
 
+@dataclass(frozen=True)
+class GradioConcurrencyWaitSnapshot:
+    limit: int
+    active: int
+    waiting: int
+    ahead: int
+
+
+@dataclass
+class _LimiterState:
+    semaphore: asyncio.Semaphore
+    active: int = 0
+    waiters: list[object] = field(default_factory=list)
+
+
 class GradioRequestConcurrencyLimiter:
     def __init__(self):
         self._lock = threading.Lock()
-        self._semaphores: dict[int, asyncio.Semaphore] = {}
+        self._states: dict[int, _LimiterState] = {}
 
-    def _get_semaphore(self, limit: int):
+    def _get_state(self, limit: int):
         if limit <= 0:
             return None
         with self._lock:
-            semaphore = self._semaphores.get(limit)
-            if semaphore is None:
-                semaphore = asyncio.Semaphore(limit)
-                self._semaphores[limit] = semaphore
-            return semaphore
+            state = self._states.get(limit)
+            if state is None:
+                state = _LimiterState(semaphore=asyncio.Semaphore(limit))
+                self._states[limit] = state
+            return state
+
+    def _build_wait_snapshot(
+        self,
+        state: _LimiterState,
+        limit: int,
+        wait_token: object,
+    ) -> GradioConcurrencyWaitSnapshot | None:
+        if wait_token not in state.waiters:
+            return None
+
+        return GradioConcurrencyWaitSnapshot(
+            limit=limit,
+            active=state.active,
+            waiting=len(state.waiters),
+            ahead=state.waiters.index(wait_token),
+        )
+
+    def _remove_waiter(self, state: _LimiterState, wait_token: object) -> None:
+        if wait_token in state.waiters:
+            state.waiters.remove(wait_token)
 
     @asynccontextmanager
-    async def acquire(self, limit: int):
-        semaphore = self._get_semaphore(limit)
-        if semaphore is None:
+    async def acquire(
+        self,
+        limit: int,
+        on_wait: Callable[[GradioConcurrencyWaitSnapshot], None] | None = None,
+    ):
+        state = self._get_state(limit)
+        if state is None:
             yield
             return
 
-        await semaphore.acquire()
+        wait_token = object()
+        should_wait = False
+        snapshot = None
+        with self._lock:
+            if state.active >= limit or state.waiters:
+                state.waiters.append(wait_token)
+                should_wait = True
+                snapshot = self._build_wait_snapshot(state, limit, wait_token)
+
+        acquire_task = None
+        last_wait_ahead = None
+        if should_wait and on_wait is not None and snapshot is not None:
+            on_wait(snapshot)
+            last_wait_ahead = snapshot.ahead
+
+        try:
+            if should_wait:
+                acquire_task = asyncio.create_task(state.semaphore.acquire())
+                while True:
+                    done, _ = await asyncio.wait(
+                        {acquire_task},
+                        timeout=STATUS_TIMER_INTERVAL_SECONDS,
+                    )
+                    if acquire_task in done:
+                        acquire_task.result()
+                        break
+
+                    if on_wait is None:
+                        continue
+
+                    with self._lock:
+                        snapshot = self._build_wait_snapshot(state, limit, wait_token)
+
+                    if snapshot is None or snapshot.ahead == last_wait_ahead:
+                        continue
+
+                    on_wait(snapshot)
+                    last_wait_ahead = snapshot.ahead
+            else:
+                await state.semaphore.acquire()
+        except Exception:
+            if acquire_task is not None:
+                acquire_task.cancel()
+                await asyncio.gather(acquire_task, return_exceptions=True)
+            if should_wait:
+                with self._lock:
+                    self._remove_waiter(state, wait_token)
+            raise
+
+        with self._lock:
+            if should_wait:
+                self._remove_waiter(state, wait_token)
+            state.active += 1
         try:
             yield
         finally:
-            semaphore.release()
+            with self._lock:
+                state.active = max(0, state.active - 1)
+            state.semaphore.release()
 
 
 _gradio_request_concurrency_limiter = GradioRequestConcurrencyLimiter()
+
+STATUS_BOX_ELEM_ID = "convert-status-box"
+STATUS_BOX_CSS = f"""
+#{STATUS_BOX_ELEM_ID} textarea {{
+    min-height: 7.5rem !important;
+    height: 7.5rem !important;
+    max-height: 7.5rem !important;
+}}
+"""
+STATUS_TIMER_INTERVAL_SECONDS = 0.1
+
+STATUS_WAITING_TO_START = "Waiting to start"
+STATUS_PREPARING_REQUEST = "Preparing request..."
+STATUS_CHECKING_SERVER = "Checking server status..."
+STATUS_SUBMITTING_TASK = "Submitting task..."
+STATUS_DOWNLOADING_RESULT = "Task completed, downloading result..."
+STATUS_PROCESSING_OUTPUT = "Preparing outputs..."
+STATUS_COMPLETED = "Completed"
+STATUS_QUEUED_ON_SERVER = "Queued on server"
+STATUS_PROCESSING_ON_SERVER = "Processing on server"
+STATUS_QUEUED_LOCALLY_PREFIX = "Queued locally:"
+
+
+@dataclass
+class StatusPanelState:
+    lines: list[str] = field(default_factory=list)
+    processing_index: int | None = None
+    processing_started_at: float | None = None
+    local_queue_index: int | None = None
+
+    def append(self, message: str) -> bool:
+        if not message:
+            return False
+
+        if message == STATUS_PROCESSING_ON_SERVER:
+            self.finalize_local_queue()
+            return self.start_processing()
+
+        self.finalize_processing()
+        if message.startswith(STATUS_QUEUED_LOCALLY_PREFIX):
+            return self.update_local_queue(message)
+
+        self.finalize_local_queue()
+        if not self.lines or self.lines[-1] != message:
+            self.lines.append(message)
+            return True
+        return False
+
+    def start_processing(self) -> bool:
+        if self.processing_started_at is not None:
+            return self.tick()
+
+        self.processing_started_at = time.monotonic()
+        self.processing_index = len(self.lines)
+        self.lines.append(format_processing_status(0.0))
+        return True
+
+    def tick(self) -> bool:
+        if self.processing_started_at is None or self.processing_index is None:
+            return False
+
+        updated = format_processing_status(
+            max(0.0, time.monotonic() - self.processing_started_at)
+        )
+        if self.lines[self.processing_index] != updated:
+            self.lines[self.processing_index] = updated
+            return True
+        return False
+
+    def finalize_processing(self) -> bool:
+        if self.processing_started_at is None or self.processing_index is None:
+            return False
+
+        self.tick()
+        self.processing_started_at = None
+        self.processing_index = None
+        return True
+
+    def update_local_queue(self, message: str) -> bool:
+        if self.local_queue_index is None:
+            self.local_queue_index = len(self.lines)
+            self.lines.append(message)
+            return True
+
+        if self.lines[self.local_queue_index] != message:
+            self.lines[self.local_queue_index] = message
+            return True
+        return False
+
+    def finalize_local_queue(self) -> bool:
+        if self.local_queue_index is None:
+            return False
+
+        self.local_queue_index = None
+        return True
+
+    @property
+    def is_processing(self) -> bool:
+        return self.processing_started_at is not None
+
+    def render(self) -> str:
+        return "\n".join(self.lines)
+
+
+def format_failed_status(error: Exception | str) -> str:
+    return f"Failed: {error}"
+
+
+def format_processing_status(elapsed_seconds: float) -> str:
+    return f"{STATUS_PROCESSING_ON_SERVER} ({elapsed_seconds:.1f}s)"
+
+
+def format_concurrency_wait_message(snapshot: GradioConcurrencyWaitSnapshot) -> str:
+    return f"{STATUS_QUEUED_LOCALLY_PREFIX} {snapshot.ahead} request(s) ahead"
+
+
+def format_remote_status_message(status: str) -> str:
+    if status == "pending":
+        return STATUS_QUEUED_ON_SERVER
+    if status == "processing":
+        return STATUS_PROCESSING_ON_SERVER
+    if status == "completed":
+        return STATUS_COMPLETED
+    if status == "failed":
+        return format_failed_status("server task failed")
+    return f"Task status: {status}"
 
 
 def compress_directory_to_zip(directory_path, output_zip_path):
@@ -145,19 +366,6 @@ def replace_image_with_base64(markdown_text, image_dir_path):
     result = re.sub(r'src="(?!data:)([^"]+)"', replace_html_src, result)
 
     return result
-
-
-async def to_markdown(file_path, end_pages=10, is_ocr=False, formula_enable=True, table_enable=True, language="ch", backend="pipeline", url=None):
-    return await _to_markdown_impl(
-        file_path=file_path,
-        end_pages=end_pages,
-        is_ocr=is_ocr,
-        formula_enable=formula_enable,
-        table_enable=table_enable,
-        language=language,
-        backend=backend,
-        url=url,
-    )
 
 
 def normalize_language(language):
@@ -244,7 +452,7 @@ def maybe_generate_local_preview(extract_root, file_name, file_suffix, backend, 
     return resolve_preview_pdf_path(parse_dir, file_name)
 
 
-async def _to_markdown_impl(
+async def _run_to_markdown_job(
     file_path,
     end_pages=10,
     is_ocr=False,
@@ -254,9 +462,14 @@ async def _to_markdown_impl(
     backend="pipeline",
     url=None,
     api_url=None,
+    status_callback: Callable[[str], None] | None = None,
 ):
     if file_path is None:
         return "", "", None, None
+
+    def emit_status(message: str) -> None:
+        if status_callback is not None:
+            status_callback(message)
 
     normalized_language = normalize_language(language)
     file_path = str(file_path)
@@ -293,24 +506,43 @@ async def _to_markdown_impl(
         timeout=_api_client.build_http_timeout(),
         follow_redirects=True,
     ) as http_client:
+        emit_status(STATUS_PREPARING_REQUEST)
+        emit_status(STATUS_CHECKING_SERVER)
         server_health = await resolve_server_health(http_client, api_url)
         effective_max_concurrent_requests = resolve_gradio_max_concurrent_requests(
             api_url=api_url,
             server_health=server_health,
         )
         async with _gradio_request_concurrency_limiter.acquire(
-            effective_max_concurrent_requests
+            effective_max_concurrent_requests,
+            on_wait=lambda snapshot: emit_status(
+                format_concurrency_wait_message(snapshot)
+            ),
         ):
+            emit_status(STATUS_SUBMITTING_TASK)
             submit_response = await _api_client.submit_parse_task(
                 base_url=server_health.base_url,
                 upload_assets=upload_assets,
                 form_data=form_data,
             )
+            emit_status(f"Task submitted：task_id={submit_response.task_id}")
+
+            last_task_status = None
+
+            def handle_task_status(status: str) -> None:
+                nonlocal last_task_status
+                if status == last_task_status:
+                    return
+                last_task_status = status
+                emit_status(format_remote_status_message(status))
+
             await _api_client.wait_for_task_result(
                 client=http_client,
                 submit_response=submit_response,
                 task_label=Path(file_path).name,
+                status_callback=handle_task_status,
             )
+            emit_status(STATUS_DOWNLOADING_RESULT)
             result_zip_path = await _api_client.download_result_zip(
                 client=http_client,
                 submit_response=submit_response,
@@ -338,6 +570,7 @@ async def _to_markdown_impl(
         parse_method=parse_method,
     )
 
+    emit_status(STATUS_PROCESSING_OUTPUT)
     zip_archive_success = compress_directory_to_zip(local_md_dir, archive_zip_path)
     if zip_archive_success == 0:
         logger.info('Compression successful')
@@ -352,7 +585,107 @@ async def _to_markdown_impl(
     if file_suffix in office_suffixes:
         preview_pdf_path = None
 
+    emit_status(STATUS_COMPLETED)
     return md_content, txt_content, str(archive_zip_path), preview_pdf_path
+
+
+async def stream_to_markdown(
+    file_path,
+    end_pages=10,
+    is_ocr=False,
+    formula_enable=True,
+    table_enable=True,
+    language="ch",
+    backend="pipeline",
+    url=None,
+    api_url=None,
+):
+    status_state = StatusPanelState(lines=[STATUS_WAITING_TO_START])
+    yield status_state.render(), None, "", "", gr.skip()
+
+    if file_path is None:
+        return
+
+    status_queue: asyncio.Queue[str] = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+
+    def enqueue_status(message: str) -> None:
+        loop.call_soon_threadsafe(status_queue.put_nowait, message)
+
+    job_task = asyncio.create_task(
+        _run_to_markdown_job(
+            file_path=file_path,
+            end_pages=end_pages,
+            is_ocr=is_ocr,
+            formula_enable=formula_enable,
+            table_enable=table_enable,
+            language=language,
+            backend=backend,
+            url=url,
+            api_url=api_url,
+            status_callback=enqueue_status,
+        )
+    )
+
+    try:
+        while True:
+            if job_task.done() and status_queue.empty():
+                status_state.finalize_processing()
+                break
+
+            queue_get_task = asyncio.create_task(status_queue.get())
+            wait_tasks: set[asyncio.Task] = {job_task, queue_get_task}
+            timer_task = None
+            if status_state.is_processing:
+                timer_task = asyncio.create_task(
+                    asyncio.sleep(STATUS_TIMER_INTERVAL_SECONDS)
+                )
+                wait_tasks.add(timer_task)
+
+            done, pending = await asyncio.wait(
+                wait_tasks,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            if queue_get_task in done:
+                message = queue_get_task.result()
+                if status_state.append(message):
+                    yield status_state.render(), None, "", "", gr.skip()
+            elif timer_task is not None and timer_task in done:
+                if status_state.tick():
+                    yield status_state.render(), None, "", "", gr.skip()
+            else:
+                queue_get_task.cancel()
+                await asyncio.gather(queue_get_task, return_exceptions=True)
+
+            for pending_task in pending:
+                if pending_task is job_task:
+                    continue
+                pending_task.cancel()
+                await asyncio.gather(pending_task, return_exceptions=True)
+
+        while not status_queue.empty():
+            status_state.append(status_queue.get_nowait())
+    except Exception as exc:
+        status_state.append(format_failed_status(exc))
+        yield status_state.render(), None, "", "", gr.skip()
+        raise
+
+    try:
+        md_content, txt_content, archive_zip_path, preview_pdf_path = await job_task
+    except Exception as exc:
+        status_state.append(format_failed_status(exc))
+        yield status_state.render(), None, "", "", gr.skip()
+        raise
+
+    status_state.append(STATUS_COMPLETED)
+    yield (
+        status_state.render(),
+        archive_zip_path,
+        md_content,
+        txt_content,
+        preview_pdf_path,
+    )
 
 
 def resolve_preview_pdf_path(local_md_dir, file_name):
@@ -597,6 +930,8 @@ def main(ctx,
             "clear": "Clear",
             "doc_preview": "Document preview",
             "examples": "Examples:",
+            "convert_status": "Conversion Status",
+            "status_waiting_to_start": STATUS_WAITING_TO_START,
             "convert_result": "Convert result",
             "md_rendering": "Markdown rendering",
             "md_text": "Markdown text",
@@ -628,6 +963,8 @@ def main(ctx,
             "clear": "清除",
             "doc_preview": "文档预览",
             "examples": "示例：",
+            "convert_status": "转换状态",
+            "status_waiting_to_start": STATUS_WAITING_TO_START,
             "convert_result": "转换结果",
             "md_rendering": "Markdown 渲染",
             "md_text": "Markdown 文本",
@@ -698,7 +1035,7 @@ def main(ctx,
         raise ValueError(f"Invalid latex delimiters type: {latex_delimiters_type}.")
 
 
-    async def convert_to_markdown(
+    async def convert_to_markdown_stream(
         file_path,
         end_pages=10,
         is_ocr=False,
@@ -708,7 +1045,7 @@ def main(ctx,
         backend="pipeline",
         url=None,
     ):
-        return await _to_markdown_impl(
+        async for update in stream_to_markdown(
             file_path=file_path,
             end_pages=end_pages,
             is_ocr=is_ocr,
@@ -718,11 +1055,12 @@ def main(ctx,
             backend=backend,
             url=url,
             api_url=api_url,
-        )
+        ):
+            yield update
 
     # suffixes = [f".{suffix}" for suffix in pdf_suffixes + image_suffixes + office_suffixes]
     suffixes = [f".{suffix}" for suffix in pdf_suffixes + image_suffixes + docx_suffixes]
-    with gr.Blocks() as demo:
+    with gr.Blocks(css=STATUS_BOX_CSS) as demo:
         gr.HTML(header)
         with gr.Row():
             with gr.Column(variant='panel', scale=5):
@@ -765,6 +1103,14 @@ def main(ctx,
                         )
 
             with gr.Column(variant='panel', scale=5):
+                status_box = gr.TextArea(
+                    label=i18n("convert_status"),
+                    value=i18n("status_waiting_to_start"),
+                    lines=4,
+                    max_lines=4,
+                    interactive=False,
+                    elem_id=STATUS_BOX_ELEM_ID,
+                )
                 output_file = gr.File(label=i18n("convert_result"), interactive=False)
                 with gr.Blocks():
                     with gr.Tab(i18n("md_rendering")):
@@ -803,13 +1149,18 @@ def main(ctx,
             outputs=[client_options, ocr_options, formula_enable, backend],
             **_private_api_kwargs
         )
-        clear_bu.add([input_file, md, doc_show, md_text, output_file, is_ocr, office_html])
+        clear_bu.add([input_file, md, doc_show, md_text, output_file, is_ocr, office_html, status_box])
 
         # 清除按钮额外重置 UI 可见性（ClearButton 不一定触发 input_file.change）
         clear_bu.click(
-            fn=lambda: (gr.update(visible=True), gr.update(value=None, visible=True), gr.update(value="", visible=False)),
+            fn=lambda: (
+                gr.update(visible=True),
+                gr.update(value=None, visible=True),
+                gr.update(value="", visible=False),
+                gr.update(value=STATUS_WAITING_TO_START),
+            ),
             inputs=[],
-            outputs=[options_group, doc_show, office_html],
+            outputs=[options_group, doc_show, office_html, status_box],
             **_private_api_kwargs
         )
 
@@ -830,17 +1181,24 @@ def main(ctx,
         _to_md_api_kwargs = (
             {
                 "api_visibility": "public" if api_enable else "private",
-                "queue": False,
+                "queue": True,
+                "show_progress": "hidden",
             }
             if IS_GRADIO_6
-            else {"api_name": "to_markdown" if api_enable else False, "queue": False}
+            else {
+                "api_name": "to_markdown" if api_enable else False,
+                "queue": True,
+                "show_progress": "hidden",
+            }
         )
         change_bu.click(
-            fn=convert_to_markdown,
+            fn=convert_to_markdown_stream,
             inputs=[input_file, max_pages, is_ocr, formula_enable, table_enable, language, backend, url],
-            outputs=[md, md_text, output_file, doc_show],
+            outputs=[status_box, output_file, md, md_text, doc_show],
             **_to_md_api_kwargs
         )
+
+    demo.queue(default_concurrency_limit=None)
 
     if IS_GRADIO_6:
         footer_links = ["gradio", "settings"]
