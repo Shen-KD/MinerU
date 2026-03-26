@@ -93,6 +93,28 @@ class GradioRequestConcurrencyLimiter:
         if wait_token in state.waiters:
             state.waiters.remove(wait_token)
 
+    async def _cleanup_acquire_interruption(
+        self,
+        state: _LimiterState,
+        acquire_task: asyncio.Task[bool],
+        wait_token: object,
+        should_wait: bool,
+    ) -> None:
+        if not acquire_task.done():
+            acquire_task.cancel()
+            await asyncio.gather(acquire_task, return_exceptions=True)
+        elif not acquire_task.cancelled():
+            try:
+                acquired = acquire_task.result()
+            except Exception:
+                acquired = False
+            if acquired:
+                state.semaphore.release()
+
+        if should_wait:
+            with self._lock:
+                self._remove_waiter(state, wait_token)
+
     @asynccontextmanager
     async def acquire(
         self,
@@ -113,7 +135,7 @@ class GradioRequestConcurrencyLimiter:
                 should_wait = True
                 snapshot = self._build_wait_snapshot(state, limit, wait_token)
 
-        acquire_task = None
+        acquire_task: asyncio.Task[bool] = asyncio.create_task(state.semaphore.acquire())
         last_wait_ahead = None
         if should_wait and on_wait is not None and snapshot is not None:
             on_wait(snapshot)
@@ -121,7 +143,6 @@ class GradioRequestConcurrencyLimiter:
 
         try:
             if should_wait:
-                acquire_task = asyncio.create_task(state.semaphore.acquire())
                 while True:
                     done, _ = await asyncio.wait(
                         {acquire_task},
@@ -143,14 +164,14 @@ class GradioRequestConcurrencyLimiter:
                     on_wait(snapshot)
                     last_wait_ahead = snapshot.ahead
             else:
-                await state.semaphore.acquire()
-        except Exception:
-            if acquire_task is not None:
-                acquire_task.cancel()
-                await asyncio.gather(acquire_task, return_exceptions=True)
-            if should_wait:
-                with self._lock:
-                    self._remove_waiter(state, wait_token)
+                await acquire_task
+        except BaseException:
+            await self._cleanup_acquire_interruption(
+                state=state,
+                acquire_task=acquire_task,
+                wait_token=wait_token,
+                should_wait=should_wait,
+            )
             raise
 
         with self._lock:
@@ -179,7 +200,6 @@ STATUS_TIMER_INTERVAL_SECONDS = 0.1
 STATUS_QUEUE_ANIMATION_INTERVAL_SECONDS = 1.0
 STATUS_QUEUE_ANIMATION_MAX_DOTS = 10
 
-STATUS_WAITING_TO_START = "Waiting to start"
 STATUS_PREPARING_REQUEST = "Preparing request..."
 STATUS_CHECKING_SERVER = "Checking server status..."
 STATUS_SUBMITTING_TASK = "Submitting task..."
@@ -686,7 +706,10 @@ async def stream_to_markdown(
     url=None,
     api_url=None,
 ):
-    status_state = StatusPanelState(lines=[STATUS_WAITING_TO_START])
+    status_state = StatusPanelState()
+    job_task: asyncio.Task | None = None
+    queue_get_task: asyncio.Task | None = None
+    timer_task: asyncio.Task | None = None
     yield status_state.render(), None, "", "", gr.skip()
 
     if file_path is None:
@@ -698,22 +721,22 @@ async def stream_to_markdown(
     def enqueue_status(message: str) -> None:
         loop.call_soon_threadsafe(status_queue.put_nowait, message)
 
-    job_task = asyncio.create_task(
-        _run_to_markdown_job(
-            file_path=file_path,
-            end_pages=end_pages,
-            is_ocr=is_ocr,
-            formula_enable=formula_enable,
-            table_enable=table_enable,
-            language=language,
-            backend=backend,
-            url=url,
-            api_url=api_url,
-            status_callback=enqueue_status,
-        )
-    )
-
     try:
+        job_task = asyncio.create_task(
+            _run_to_markdown_job(
+                file_path=file_path,
+                end_pages=end_pages,
+                is_ocr=is_ocr,
+                formula_enable=formula_enable,
+                table_enable=table_enable,
+                language=language,
+                backend=backend,
+                url=url,
+                api_url=api_url,
+                status_callback=enqueue_status,
+            )
+        )
+
         while True:
             if job_task.done() and status_queue.empty():
                 status_state.finalize_processing()
@@ -751,6 +774,8 @@ async def stream_to_markdown(
                     continue
                 pending_task.cancel()
                 await asyncio.gather(pending_task, return_exceptions=True)
+            queue_get_task = None
+            timer_task = None
 
         while not status_queue.empty():
             status_state.append(status_queue.get_nowait())
@@ -758,6 +783,12 @@ async def stream_to_markdown(
         status_state.append(format_failed_status(exc))
         yield status_state.render(), None, "", "", gr.skip()
         raise
+    finally:
+        for task in (queue_get_task, timer_task, job_task):
+            if task is None or task.done():
+                continue
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     try:
         md_content, txt_content, archive_zip_path, preview_pdf_path = await job_task
@@ -1019,7 +1050,6 @@ def main(ctx,
             "doc_preview": "Document preview",
             "examples": "Examples:",
             "convert_status": "Conversion Status",
-            "status_waiting_to_start": STATUS_WAITING_TO_START,
             "convert_result": "Convert result",
             "md_rendering": "Markdown rendering",
             "md_text": "Markdown text",
@@ -1052,7 +1082,6 @@ def main(ctx,
             "doc_preview": "文档预览",
             "examples": "示例：",
             "convert_status": "转换状态",
-            "status_waiting_to_start": STATUS_WAITING_TO_START,
             "convert_result": "转换结果",
             "md_rendering": "Markdown 渲染",
             "md_text": "Markdown 文本",
@@ -1193,7 +1222,7 @@ def main(ctx,
             with gr.Column(variant='panel', scale=5):
                 status_box = gr.TextArea(
                     label=i18n("convert_status"),
-                    value=i18n("status_waiting_to_start"),
+                    value="",
                     lines=4,
                     max_lines=4,
                     interactive=False,
@@ -1245,7 +1274,7 @@ def main(ctx,
                 gr.update(visible=True),
                 gr.update(value=None, visible=True),
                 gr.update(value="", visible=False),
-                gr.update(value=STATUS_WAITING_TO_START),
+                gr.update(value=""),
             ),
             inputs=[],
             outputs=[options_group, doc_show, office_html, status_box],
