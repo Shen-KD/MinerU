@@ -1,7 +1,7 @@
 import asyncio
-import glob
+import mimetypes
+import multiprocessing
 import os
-import re
 import shutil
 import sys
 import tempfile
@@ -43,6 +43,7 @@ from mineru.cli.common import (
     read_fn,
     uniquify_task_stems,
 )
+from mineru.cli.output_paths import resolve_parse_dir
 from mineru.cli.api_protocol import (
     API_PROTOCOL_VERSION,
     DEFAULT_MAX_CONCURRENT_REQUESTS,
@@ -88,6 +89,33 @@ def env_flag_enabled(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.lower() in ("1", "true", "yes", "on")
+
+
+def is_main_multiprocessing_process() -> bool:
+    try:
+        return multiprocessing.current_process().name == "MainProcess"
+    except Exception:
+        return True
+
+
+def install_stdin_shutdown_watcher(server: uvicorn.Server) -> None:
+    if not env_flag_enabled("MINERU_API_SHUTDOWN_ON_STDIN_EOF"):
+        return
+
+    def _watch_stdin_for_eof() -> None:
+        stdin_stream = getattr(sys.stdin, "buffer", sys.stdin)
+        try:
+            stdin_stream.read()
+        except Exception:
+            return
+        server.should_exit = True
+
+    watcher = threading.Thread(
+        target=_watch_stdin_for_eof,
+        name="mineru-api-stdin-shutdown",
+        daemon=True,
+    )
+    watcher.start()
 
 
 @dataclass
@@ -209,7 +237,8 @@ def create_app():
     _configured_max_concurrent_requests = max_concurrent_requests
     app.state.max_concurrent_requests = max_concurrent_requests
     _request_semaphore = asyncio.Semaphore(max_concurrent_requests)
-    logger.info(f"Request concurrency limited to {max_concurrent_requests}")
+    if is_main_multiprocessing_process():
+        logger.info(f"Request concurrency limited to {max_concurrent_requests}")
 
     app.add_middleware(GZipMiddleware, minimum_size=1000)
     return app
@@ -270,19 +299,6 @@ def validate_parse_method(parse_method: str) -> str:
     return parse_method
 
 
-def sanitize_filename(filename: str) -> str:
-    """
-    格式化压缩文件的文件名
-    移除路径遍历字符, 保留 Unicode 字母、数字、._-
-    禁止隐藏文件
-    """
-    sanitized = re.sub(r"[/\\.]{2,}|[/\\]", "", filename)
-    sanitized = re.sub(r"[^\w.-]", "_", sanitized, flags=re.UNICODE)
-    if sanitized.startswith("."):
-        sanitized = "_" + sanitized[1:]
-    return sanitized or "unnamed"
-
-
 def cleanup_file(file_path: str) -> None:
     """清理临时文件或目录"""
     try:
@@ -316,6 +332,25 @@ def encode_image(image_path: str) -> str:
         return b64encode(f.read()).decode()
 
 
+def get_images_dir_image_paths(images_dir: str) -> list[str]:
+    """Return all supported image files directly under images_dir."""
+    if not os.path.isdir(images_dir):
+        return []
+
+    return sorted(
+        str(path)
+        for path in Path(images_dir).iterdir()
+        if path.is_file() and path.suffix.lstrip(".").lower() in image_suffixes
+    )
+
+
+def get_image_mime_type(image_path: str) -> str:
+    mime_type, _ = mimetypes.guess_type(image_path)
+    if mime_type:
+        return mime_type
+    return "image/jpeg"
+
+
 def get_infer_result(
     file_suffix_identifier: str, pdf_name: str, parse_dir: str
 ) -> Optional[str]:
@@ -335,22 +370,15 @@ def normalize_lang_list(lang_list: list[str], file_count: int) -> list[str]:
 
 
 def get_parse_dir(output_dir: str, pdf_name: str, backend: str, parse_method: str) -> str:
-    candidates = []
-    if backend.startswith("pipeline"):
-        candidates.append(os.path.join(output_dir, pdf_name, parse_method))
-    elif backend.startswith("vlm"):
-        candidates.append(os.path.join(output_dir, pdf_name, "vlm"))
-    elif backend.startswith("hybrid"):
-        candidates.append(os.path.join(output_dir, pdf_name, f"hybrid_{parse_method}"))
-
-    candidates.append(os.path.join(output_dir, pdf_name, "office"))
-    for candidate in candidates:
-        if os.path.exists(candidate):
-            return candidate
-
-    if candidates:
-        return candidates[0]
-    raise ValueError(f"Unknown backend type: {backend}")
+    return str(
+        resolve_parse_dir(
+            output_dir,
+            pdf_name,
+            backend,
+            parse_method,
+            allow_office_fallback=True,
+        )
+    )
 
 
 def is_task_terminal(status: str) -> bool:
@@ -394,12 +422,11 @@ def build_result_dict(
             )
         if return_images:
             images_dir = os.path.join(parse_dir, "images")
-            safe_pattern = os.path.join(glob.escape(images_dir), "*.jpg")
-            image_paths = glob.glob(safe_pattern)
+            image_paths = get_images_dir_image_paths(images_dir)
             data["images"] = {
                 os.path.basename(
                     image_path
-                ): f"data:image/jpeg;base64,{encode_image(image_path)}"
+                ): f"data:{get_image_mime_type(image_path)};base64,{encode_image(image_path)}"
                 for image_path in image_paths
             }
     return result_dict
@@ -500,7 +527,7 @@ def create_result_zip(
 
             if return_images:
                 images_dir = os.path.join(parse_dir, "images")
-                image_paths = glob.glob(os.path.join(glob.escape(images_dir), "*.jpg"))
+                image_paths = get_images_dir_image_paths(images_dir)
                 for image_path in image_paths:
                     zf.write(
                         image_path,
@@ -1424,7 +1451,16 @@ def main(ctx, host, port, reload, **kwargs):
             access_log=access_log,
         )
     else:
-        uvicorn.run(app, host=host, port=port, reload=False, access_log=access_log)
+        config = uvicorn.Config(
+            app,
+            host=host,
+            port=port,
+            reload=False,
+            access_log=access_log,
+        )
+        server = uvicorn.Server(config)
+        install_stdin_shutdown_watcher(server)
+        server.run()
 
 
 if __name__ == "__main__":
