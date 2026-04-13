@@ -16,13 +16,13 @@ from mineru.backend.hybrid.hybrid_model_output_to_middle_json import (
     finalize_middle_json,
     init_middle_json,
 )
+from mineru.backend.utils.runtime_utils import exclude_progress_bar_idle_time
 from mineru.backend.pipeline.model_init import HybridModelSingleton
 from mineru.backend.vlm.vlm_analyze import (
     ModelSingleton,
     aio_predictor_execution_guard,
     predictor_execution_guard,
     _maybe_enable_serial_execution,
-    _get_model_async,
 )
 from mineru.data.data_reader_writer import DataWriter
 from mineru.utils.config_reader import get_device, get_processing_window_size
@@ -41,6 +41,7 @@ from mineru.utils.pdfium_guard import (
 os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'  # 让mps可以fallback
 os.environ['NO_ALBUMENTATIONS_UPDATE'] = '1'  # 禁止albumentations检查更新
 
+LAYOUT_BASE_BATCH_SIZE = 1
 MFR_BASE_BATCH_SIZE = 16
 OCR_DET_BASE_BATCH_SIZE = 8
 
@@ -62,7 +63,7 @@ def ocr_det(
     model_list,
     mfd_res,
     _ocr_enable,
-    batch_radio: int = 1,
+    batch_ratio: int = 1,
 ):
     def _set_temp_pixel_bbox(res, pixel_bbox):
         res["_normalized_bbox"] = list(res["bbox"])
@@ -172,7 +173,7 @@ def ocr_det(
                 batch_images.append(padded_img)
 
             # 批处理检测
-            det_batch_size = min(len(batch_images), batch_radio*OCR_DET_BASE_BATCH_SIZE)
+            det_batch_size = min(len(batch_images), batch_ratio * OCR_DET_BASE_BATCH_SIZE)
             batch_results = hybrid_pipeline_model.ocr_model.text_detector.batch_predict(batch_images, det_batch_size)
 
             # 处理批处理结果
@@ -281,7 +282,7 @@ def _process_ocr_and_formulas(
     language,
     inline_formula_enable,
     _ocr_enable,
-    batch_radio: int = 1,
+    batch_ratio: int = 1,
 ):
     """处理OCR和公式识别"""
 
@@ -303,13 +304,16 @@ def _process_ocr_and_formulas(
         # 在进行`行内`公式检测和识别前，先将图像中的图片、表格、`行间`公式区域mask掉
         np_images = mask_image_regions(np_images, model_list)
         # 使用layout模型提供行内公式检测框
-        images_layout_res = hybrid_pipeline_model.layout_model.batch_predict(np_images, batch_size=1)
+        images_layout_res = hybrid_pipeline_model.layout_model.batch_predict(
+            np_images,
+            batch_size=min(8, batch_ratio * LAYOUT_BASE_BATCH_SIZE),
+        )
         images_mfd_res = _build_inline_formula_inputs(images_layout_res)
         # 公式识别
         inline_formula_list = hybrid_pipeline_model.mfr_model.batch_predict(
             images_mfd_res,
             np_images,
-            batch_size=batch_radio * MFR_BASE_BATCH_SIZE,
+            batch_size=batch_ratio * MFR_BASE_BATCH_SIZE,
             interline_enable=True,
         )
     else:
@@ -332,7 +336,7 @@ def _process_ocr_and_formulas(
         model_list,
         mfd_res,
         _ocr_enable,
-        batch_radio=batch_radio,
+        batch_ratio=batch_ratio,
     )
 
     # 如果需要ocr则做ocr_rec
@@ -474,7 +478,7 @@ def get_batch_ratio(device):
     ------------------|------------------------
     <= 6   GB         | 8
     <= 4   GB         | 4
-    <= 2.5 GB         | 2
+    <= 3   GB         | 2
     <= 2   GB         | 1
     例如：
     export MINERU_HYBRID_BATCH_RATIO=4
@@ -575,7 +579,9 @@ def doc_analyze(
         batch_ratio = get_batch_ratio(device) if not _vlm_ocr_enable else 1
 
         infer_start = time.time()
-        with tqdm(total=page_count, desc="Processing pages") as progress_bar:
+        progress_bar = None
+        last_append_end_time = None
+        try:
             for window_index, window_start in enumerate(range(0, page_count, effective_window_size or 1)):
                 window_end = min(page_count - 1, window_start + effective_window_size - 1)
                 images_list = load_images_from_pdf_doc(
@@ -583,6 +589,7 @@ def doc_analyze(
                     start_page_id=window_start,
                     end_page_id=window_end,
                     image_type=ImageType.PIL,
+                    pdf_bytes=pdf_bytes,
                 )
                 try:
                     images_pil_list = [image_dict["img_pil"] for image_dict in images_list]
@@ -606,10 +613,18 @@ def doc_analyze(
                             language,
                             inline_formula_enable,
                             _ocr_enable,
-                            batch_radio=batch_ratio,
+                            batch_ratio=batch_ratio,
                         )
 
                     model_list.extend(window_model_list)
+                    if progress_bar is None:
+                        progress_bar = tqdm(total=page_count, desc="Processing pages")
+                    else:
+                        exclude_progress_bar_idle_time(
+                            progress_bar,
+                            last_append_end_time,
+                            now=time.time(),
+                        )
                     append_page_model_list_to_middle_json(
                         middle_json,
                         window_model_list,
@@ -621,8 +636,12 @@ def doc_analyze(
                         _vlm_ocr_enable=_vlm_ocr_enable,
                         progress_bar=progress_bar,
                     )
+                    last_append_end_time = time.time()
                 finally:
                     _close_images(images_list)
+        finally:
+            if progress_bar is not None:
+                progress_bar.close()
 
         infer_time = round(time.time() - infer_start, 2)
         if infer_time > 0 and page_count > 0:
@@ -659,7 +678,7 @@ async def aio_doc_analyze(
     **kwargs,
 ):
     if predictor is None:
-        predictor = await _get_model_async(backend, model_path, server_url, **kwargs)
+        predictor = ModelSingleton().get_model(backend, model_path, server_url, **kwargs)
     predictor = _maybe_enable_serial_execution(predictor, backend)
 
     device = get_device()
@@ -688,7 +707,9 @@ async def aio_doc_analyze(
         batch_ratio = get_batch_ratio(device) if not _vlm_ocr_enable else 1
 
         infer_start = time.time()
-        with tqdm(total=page_count, desc="Processing pages") as progress_bar:
+        progress_bar = None
+        last_append_end_time = None
+        try:
             for window_index, window_start in enumerate(range(0, page_count, effective_window_size or 1)):
                 window_end = min(page_count - 1, window_start + effective_window_size - 1)
                 images_list = load_images_from_pdf_doc(
@@ -696,6 +717,7 @@ async def aio_doc_analyze(
                     start_page_id=window_start,
                     end_page_id=window_end,
                     image_type=ImageType.PIL,
+                    pdf_bytes=pdf_bytes,
                 )
                 try:
                     images_pil_list = [image_dict["img_pil"] for image_dict in images_list]
@@ -719,10 +741,18 @@ async def aio_doc_analyze(
                             language,
                             inline_formula_enable,
                             _ocr_enable,
-                            batch_radio=batch_ratio,
+                            batch_ratio=batch_ratio,
                         )
 
                     model_list.extend(window_model_list)
+                    if progress_bar is None:
+                        progress_bar = tqdm(total=page_count, desc="Processing pages")
+                    else:
+                        exclude_progress_bar_idle_time(
+                            progress_bar,
+                            last_append_end_time,
+                            now=time.time(),
+                        )
                     append_page_model_list_to_middle_json(
                         middle_json,
                         window_model_list,
@@ -734,8 +764,12 @@ async def aio_doc_analyze(
                         _vlm_ocr_enable=_vlm_ocr_enable,
                         progress_bar=progress_bar,
                     )
+                    last_append_end_time = time.time()
                 finally:
                     _close_images(images_list)
+        finally:
+            if progress_bar is not None:
+                progress_bar.close()
 
         infer_time = round(time.time() - infer_start, 2)
         if infer_time > 0 and page_count > 0:

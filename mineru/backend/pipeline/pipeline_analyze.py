@@ -1,5 +1,4 @@
 import os
-import threading
 import time
 from typing import List, Tuple
 
@@ -8,12 +7,13 @@ from PIL import Image
 from loguru import logger
 from tqdm import tqdm
 
-from .model_init import MineruPipelineModel
+from .model_init import MineruPipelineModel, PIPELINE_MODEL_INIT_LOCK
 from .model_json_to_middle_json import (
     append_batch_results_to_middle_json,
     finalize_middle_json,
     init_middle_json,
 )
+from ..utils.runtime_utils import exclude_progress_bar_idle_time
 from mineru.utils.config_reader import get_device, get_processing_window_size
 from ...utils.enum_class import ImageType
 from ...utils.pdf_classify import classify
@@ -32,7 +32,7 @@ os.environ['NO_ALBUMENTATIONS_UPDATE'] = '1'  # 禁止albumentations检查更新
 class ModelSingleton:
     _instance = None
     _models = {}
-    _lock = threading.RLock()
+    _lock = PIPELINE_MODEL_INIT_LOCK
 
     def __new__(cls, *args, **kwargs):
         with cls._lock:
@@ -160,6 +160,7 @@ def doc_analyze_streaming(
         doc_contexts.append(
             {
                 'doc_index': doc_index,
+                'pdf_bytes': pdf_bytes,
                 'pdf_doc': pdf_doc,
                 'page_count': page_count,
                 'next_page_idx': 0,
@@ -187,7 +188,9 @@ def doc_analyze_streaming(
     processed_pages = 0
     infer_start = time.time()
     try:
-        with tqdm(total=total_pages, desc="Processing pages") as progress_bar:
+        progress_bar = None
+        last_append_end_time = None
+        try:
             batch_index = 0
             while processed_pages < total_pages:
                 batch_index += 1
@@ -209,6 +212,7 @@ def doc_analyze_streaming(
                         start_page_id=page_start,
                         end_page_id=page_end,
                         image_type=ImageType.PIL,
+                        pdf_bytes=context['pdf_bytes'],
                     )
                     images_with_extra_info = [
                         (image_dict['img_pil'], context['ocr_enable'], context['lang'])
@@ -238,6 +242,14 @@ def doc_analyze_streaming(
                     formula_enable=formula_enable,
                     table_enable=table_enable,
                 )
+                if progress_bar is None:
+                    progress_bar = tqdm(total=total_pages, desc="Processing pages")
+                else:
+                    exclude_progress_bar_idle_time(
+                        progress_bar,
+                        last_append_end_time,
+                        now=time.time(),
+                    )
 
                 result_offset = 0
                 for context, images_list, page_start, take_count in batch_payloads:
@@ -260,7 +272,11 @@ def doc_analyze_streaming(
                     if context['next_page_idx'] >= context['page_count'] and not context['closed']:
                         _finalize_processing_window_context(context, on_doc_ready)
 
+                last_append_end_time = time.time()
                 processed_pages += len(batch_images)
+        finally:
+            if progress_bar is not None:
+                progress_bar.close()
 
         infer_time = round(time.time() - infer_start, 2)
         if infer_time > 0:
@@ -298,7 +314,9 @@ def batch_image_analyze(
             ) from e
 
     gpu_memory = get_vram(device)
-    if gpu_memory >= 16:
+    if gpu_memory >= 32:
+        batch_ratio = 16
+    elif gpu_memory >= 16:
         batch_ratio = 8
     elif gpu_memory >= 8:
         batch_ratio = 4
