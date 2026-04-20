@@ -80,7 +80,8 @@ docker run -u root --name mineru_docker --privileged=true \
 ```
 
 >[!TIP]
-> 请根据实际情况选择使用`vllm`或`lmdeploy`版本的镜像，如需使用lmdeploy，替换上述命令中的`mineru:npu-vllm-latest`为`mineru:npu-lmdeploy-latest`即可。
+> - 请根据实际情况选择使用`vllm`或`lmdeploy`版本的镜像，如需使用lmdeploy，替换上述命令中的`mineru:npu-vllm-latest`为`mineru:npu-lmdeploy-latest`即可。
+> - 在 Ascend NPU 环境下，请务必保留环境变量`MINERU_LMDEPLOY_DEVICE=ascend`，即使您是使用`vllm`后端，也需要保留该环境变量。
 
 执行该命令后，您将进入到Docker容器的交互式终端，您可以直接在容器内运行MinerU相关命令来使用MinerU的功能。
 您也可以直接通过替换`/bin/bash`为服务启动命令来启动MinerU服务，详细说明请参考[通过命令启动服务](https://opendatalab.github.io/MinerU/zh/usage/quick_usage/#apiwebuihttp-clientserver)。
@@ -161,11 +162,6 @@ docker run -u root --name mineru_docker --privileged=true \
       <td>🟢</td>
       <td>🟢</td>
     </tr>
-    <tr>
-      <td colspan="2">数据并行 (--data-parallel-size/--dp)</td>
-      <td>🟢</td>
-      <td>🔴</td>
-    </tr>
   </tbody>
 </table>
 
@@ -175,4 +171,5 @@ docker run -u root --name mineru_docker --privileged=true \
 🔴: 不支持，无法运行，或精度存在较大差异
 
 >[!TIP]
->NPU加速卡指定可用加速卡的方式与NVIDIA GPU类似，请参考[ASCEND_RT_VISIBLE_DEVICES](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850alpha001/maintenref/envvar/envref_07_0028.html)
+> - NPU加速卡指定可用加速卡的方式与NVIDIA GPU类似，请参考[ASCEND_RT_VISIBLE_DEVICES](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850alpha001/maintenref/envvar/envref_07_0028.html)
+> - 在Ascend平台可以通过`npu-smi info`命令查看加速卡的使用情况，并根据需要指定空闲的加速卡ID以避免资源冲突。
