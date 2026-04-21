@@ -1,3 +1,4 @@
+# Copyright (c) Opendatalab. All rights reserved.
 import asyncio
 import json
 import os
@@ -29,14 +30,22 @@ from mineru.cli.api_client import (
     LOCAL_API_STARTUP_TIMEOUT_SECONDS,
     TASK_RESULT_TIMEOUT_SECONDS,
     TASK_STATUS_POLL_INTERVAL_SECONDS,
+    build_managed_process_popen_kwargs,
     build_http_timeout,
     find_free_port,
     normalize_base_url,
+    stop_managed_process,
     strip_local_api_network_args,
     response_detail,
 )
 from mineru.cli.api_protocol import API_PROTOCOL_VERSION
 from mineru.cli.common import normalize_upload_filename
+from mineru.cli.public_http_client_policy import (
+    configure_public_http_client_policy,
+    is_public_bind_host,
+    validate_public_http_client_request,
+    warn_if_public_http_client_policy as _warn_if_public_http_client_policy,
+)
 from mineru.cli.vlm_preload import build_local_api_cli_args
 from mineru.version import __version__
 
@@ -63,11 +72,6 @@ WORKER_REFRESH_INTERVAL_SECONDS = 2.0
 MIN_HEALTHY_PROCESSING_WINDOW_SIZE = 1
 MINERU_ROUTER_PUBLIC_BIND_EXPOSED_ENV = "MINERU_ROUTER_PUBLIC_BIND_EXPOSED"
 MINERU_ROUTER_ALLOW_PUBLIC_HTTP_CLIENT_ENV = "MINERU_ROUTER_ALLOW_PUBLIC_HTTP_CLIENT"
-PUBLIC_HTTP_CLIENT_DISABLED_DETAIL = (
-    "Publicly exposed API disables *-http-client backends and server_url by "
-    "default. Rebind to 127.0.0.1 or start with "
-    "--allow-public-http-client if you understand the SSRF risk."
-)
 
 
 def utc_now_iso() -> str:
@@ -124,51 +128,11 @@ def is_task_terminal(status: str) -> bool:
     return status in TASK_TERMINAL_STATES
 
 
-def is_public_bind_host(host: str) -> bool:
-    return host in {"0.0.0.0", "::"}
-
-
-def configure_public_http_client_policy(
-    app: FastAPI,
-    *,
-    public_bind_exposed: bool,
-    allow_public_http_client: bool,
-) -> None:
-    app.state.public_bind_exposed = public_bind_exposed
-    app.state.allow_public_http_client = allow_public_http_client
-
-
-def validate_public_http_client_request(
-    *,
-    public_bind_exposed: bool,
-    allow_public_http_client: bool,
-    backend: str,
-    server_url: str | None,
-) -> None:
-    if not public_bind_exposed or allow_public_http_client:
-        return
-    if backend.endswith("-http-client") or bool(server_url and server_url.strip()):
-        raise HTTPException(status_code=400, detail=PUBLIC_HTTP_CLIENT_DISABLED_DETAIL)
-
-
 def warn_if_public_http_client_policy(host: str, allow_public_http_client: bool) -> None:
-    if not is_public_bind_host(host):
-        return
-    if allow_public_http_client:
-        logger.warning(
-            "MinerU router is listening on {} with --allow-public-http-client enabled. "
-            "Requests may supply remote HTTP inference endpoints and turn the service "
-            "into an externally driven outbound request primitive, creating SSRF and "
-            "internal network probing risk.",
-            host,
-        )
-        return
-    logger.warning(
-        "MinerU router is listening on {}. Disabling *-http-client backends and "
-        "server_url by default because these inputs let callers choose remote HTTP "
-        "inference endpoints; when the API is publicly reachable, that creates SSRF "
-        "and internal network probing risk.",
-        host,
+    _warn_if_public_http_client_policy(
+        service_name="router",
+        host=host,
+        allow_public_http_client=allow_public_http_client,
     )
 
 
@@ -356,6 +320,7 @@ class ManagedLocalServer:
     connect_host: str = field(init=False)
     base_url: str | None = None
     process: subprocess.Popen[bytes] | None = None
+    process_group_id: int | None = None
     temp_dir: tempfile.TemporaryDirectory[str] | None = None
 
     def __post_init__(self) -> None:
@@ -395,7 +360,13 @@ class ManagedLocalServer:
             str(resolved_port),
             *worker_cli_args,
         ]
-        self.process = subprocess.Popen(command, cwd=os.getcwd(), env=env)
+        self.process = subprocess.Popen(
+            command,
+            cwd=os.getcwd(),
+            env=env,
+            **build_managed_process_popen_kwargs(),
+        )
+        self.process_group_id = self.process.pid
 
         try:
             await self.wait_until_ready(client)
@@ -434,15 +405,17 @@ class ManagedLocalServer:
 
     def stop(self) -> None:
         process = self.process
+        process_group_id = self.process_group_id
         self.process = None
+        self.process_group_id = None
         try:
-            if process is not None and process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=5)
+            if process is not None or process_group_id is not None:
+                stop_managed_process(
+                    process,
+                    process_group_id=process_group_id,
+                    shutdown_timeout_seconds=5,
+                    use_stdin_shutdown_watcher=False,
+                )
         finally:
             temp_dir = self.temp_dir
             self.temp_dir = None
