@@ -44,6 +44,12 @@ from mineru.cli.common import (
     read_fn,
     uniquify_task_stems,
 )
+from mineru.cli.public_http_client_policy import (
+    configure_public_http_client_policy,
+    is_public_bind_host,
+    validate_public_http_client_request,
+    warn_if_public_http_client_policy as _warn_if_public_http_client_policy,
+)
 from mineru.cli.output_paths import resolve_parse_dir
 from mineru.cli.api_protocol import (
     API_PROTOCOL_VERSION,
@@ -76,6 +82,7 @@ TASK_COMPLETED = "completed"
 TASK_FAILED = "failed"
 TASK_TERMINAL_STATES = {TASK_COMPLETED, TASK_FAILED}
 SUPPORTED_UPLOAD_SUFFIXES = pdf_suffixes + image_suffixes + office_suffixes
+RESULT_IMAGE_SUFFIXES = set(image_suffixes) | {"svg"}
 DEFAULT_TASK_RETENTION_SECONDS = 24 * 60 * 60
 DEFAULT_TASK_CLEANUP_INTERVAL_SECONDS = 5 * 60
 DEFAULT_OUTPUT_ROOT = "./output"
@@ -86,11 +93,6 @@ FILE_PARSE_TASK_STATUS_URL_HEADER = "X-MinerU-Task-Status-Url"
 FILE_PARSE_TASK_RESULT_URL_HEADER = "X-MinerU-Task-Result-Url"
 MINERU_API_PUBLIC_BIND_EXPOSED_ENV = "MINERU_API_PUBLIC_BIND_EXPOSED"
 MINERU_API_ALLOW_PUBLIC_HTTP_CLIENT_ENV = "MINERU_API_ALLOW_PUBLIC_HTTP_CLIENT"
-PUBLIC_HTTP_CLIENT_DISABLED_DETAIL = (
-    "Publicly exposed API disables *-http-client backends and server_url by "
-    "default. Rebind to 127.0.0.1 or start with "
-    "--allow-public-http-client if you understand the SSRF risk."
-)
 SWAGGER_UI_FILE_ARRAY_SCHEMA_EXTRA = {
     # Swagger UI 5 currently fails to render a usable multi-file picker when
     # FastAPI emits OpenAPI 3.1 byte arrays with contentMediaType.
@@ -362,51 +364,11 @@ def get_output_root() -> Path:
     return root.resolve()
 
 
-def is_public_bind_host(host: str) -> bool:
-    return host in {"0.0.0.0", "::"}
-
-
-def configure_public_http_client_policy(
-    app: FastAPI,
-    *,
-    public_bind_exposed: bool,
-    allow_public_http_client: bool,
-) -> None:
-    app.state.public_bind_exposed = public_bind_exposed
-    app.state.allow_public_http_client = allow_public_http_client
-
-
-def validate_public_http_client_request(
-    *,
-    public_bind_exposed: bool,
-    allow_public_http_client: bool,
-    backend: str,
-    server_url: str | None,
-) -> None:
-    if not public_bind_exposed or allow_public_http_client:
-        return
-    if backend.endswith("-http-client") or bool(server_url and server_url.strip()):
-        raise HTTPException(status_code=400, detail=PUBLIC_HTTP_CLIENT_DISABLED_DETAIL)
-
-
 def warn_if_public_http_client_policy(host: str, allow_public_http_client: bool) -> None:
-    if not is_public_bind_host(host):
-        return
-    if allow_public_http_client:
-        logger.warning(
-            "MinerU API is listening on {} with --allow-public-http-client enabled. "
-            "Requests may supply remote HTTP inference endpoints and turn the service "
-            "into an externally driven outbound request primitive, creating SSRF and "
-            "internal network probing risk.",
-            host,
-        )
-        return
-    logger.warning(
-        "MinerU API is listening on {}. Disabling *-http-client backends and "
-        "server_url by default because these inputs let callers choose remote HTTP "
-        "inference endpoints; when the API is publicly reachable, that creates SSRF "
-        "and internal network probing risk.",
-        host,
+    _warn_if_public_http_client_policy(
+        service_name="API",
+        host=host,
+        allow_public_http_client=allow_public_http_client,
     )
 
 
@@ -463,7 +425,7 @@ def get_images_dir_image_paths(images_dir: str) -> list[str]:
     return sorted(
         str(path)
         for path in Path(images_dir).iterdir()
-        if path.is_file() and path.suffix.lstrip(".").lower() in image_suffixes
+        if path.is_file() and path.suffix.lstrip(".").lower() in RESULT_IMAGE_SUFFIXES
     )
 
 
@@ -679,7 +641,17 @@ def create_result_zip(
     return zip_path
 
 
-def build_result_response(
+def _cleanup_generated_zip_task(task: asyncio.Task[str]) -> None:
+    try:
+        generated_zip_path = task.result()
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        return
+    cleanup_file(generated_zip_path)
+
+
+async def build_result_response(
     background_tasks: BackgroundTasks,
     status_code: int,
     output_dir: str,
@@ -696,18 +668,26 @@ def build_result_response(
     zip_filename: str = "results.zip",
 ) -> Response:
     if response_format_zip:
-        zip_path = create_result_zip(
-            output_dir=output_dir,
-            pdf_file_names=pdf_file_names,
-            backend=backend,
-            parse_method=parse_method,
-            return_md=return_md,
-            return_middle_json=return_middle_json,
-            return_model_output=return_model_output,
-            return_content_list=return_content_list,
-            return_images=return_images,
-            return_original_file=return_original_file,
+        zip_task = asyncio.create_task(
+            asyncio.to_thread(
+                create_result_zip,
+                output_dir=output_dir,
+                pdf_file_names=pdf_file_names,
+                backend=backend,
+                parse_method=parse_method,
+                return_md=return_md,
+                return_middle_json=return_middle_json,
+                return_model_output=return_model_output,
+                return_content_list=return_content_list,
+                return_images=return_images,
+                return_original_file=return_original_file,
+            )
         )
+        try:
+            zip_path = await asyncio.shield(zip_task)
+        except asyncio.CancelledError:
+            zip_task.add_done_callback(_cleanup_generated_zip_task)
+            raise
         background_tasks.add_task(cleanup_file, zip_path)
         return FileResponse(
             path=zip_path,
@@ -716,7 +696,8 @@ def build_result_response(
             status_code=status_code,
         )
 
-    result_dict = build_result_dict(
+    result_dict = await asyncio.to_thread(
+        build_result_dict,
         output_dir=output_dir,
         pdf_file_names=pdf_file_names,
         backend=backend,
@@ -747,14 +728,14 @@ def build_task_submission_response(
     return JSONResponse(status_code=202, content=payload)
 
 
-def build_sync_file_parse_response(
+async def build_sync_file_parse_response(
     background_tasks: BackgroundTasks,
     task: AsyncParseTask,
     request: Request,
 ) -> Response:
     task_payload = task.to_status_payload(request)
     if task.response_format_zip:
-        response = build_result_response(
+        response = await build_result_response(
             background_tasks=background_tasks,
             status_code=200,
             output_dir=task.output_dir,
@@ -776,7 +757,8 @@ def build_sync_file_parse_response(
         response.headers[FILE_PARSE_TASK_RESULT_URL_HEADER] = task_payload["result_url"]
         return response
 
-    result_dict = build_result_dict(
+    result_dict = await asyncio.to_thread(
+        build_result_dict,
         output_dir=task.output_dir,
         pdf_file_names=task.file_names,
         backend=task.backend,
@@ -1451,7 +1433,7 @@ async def parse_pdf(
             },
         )
 
-    return build_sync_file_parse_response(
+    return await build_sync_file_parse_response(
         background_tasks=background_tasks,
         task=task,
         request=http_request,
@@ -1516,7 +1498,7 @@ async def get_async_task_result(
             },
         )
 
-    return build_result_response(
+    return await build_result_response(
         background_tasks=background_tasks,
         status_code=200,
         output_dir=task.output_dir,

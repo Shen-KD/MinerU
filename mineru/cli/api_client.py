@@ -616,6 +616,15 @@ def build_http_timeout() -> httpx.Timeout:
     return httpx.Timeout(connect=10, read=60, write=300, pool=30)
 
 
+def build_result_download_timeout() -> httpx.Timeout:
+    return httpx.Timeout(
+        connect=10,
+        read=TASK_RESULT_TIMEOUT_SECONDS,
+        write=300,
+        pool=30,
+    )
+
+
 def find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -828,38 +837,31 @@ def submit_parse_task_sync(
     upload_assets: Sequence[UploadAsset],
     form_data: dict[str, str | list[str]],
 ) -> SubmitResponse:
-    task_url = f"{base_url}{TASKS_ENDPOINT}"
-    try:
-        with httpx.Client(timeout=build_http_timeout(), follow_redirects=True) as sync_client:
-            with ExitStack() as stack:
-                files = []
-                for upload_asset in upload_assets:
-                    mime_type = (
-                        mimetypes.guess_type(upload_asset.upload_name)[0]
-                        or "application/octet-stream"
-                    )
-                    file_handle = stack.enter_context(open(upload_asset.path, "rb"))
-                    files.append(
-                        (
-                            "files",
-                            (
-                                upload_asset.upload_name,
-                                file_handle,
-                                mime_type,
-                            ),
-                        )
-                    )
-
-                response = sync_client.post(
-                    task_url,
-                    data=form_data,
-                    files=files,
+    with httpx.Client(timeout=build_http_timeout(), follow_redirects=True) as sync_client:
+        with ExitStack() as stack:
+            files = []
+            for upload_asset in upload_assets:
+                mime_type = (
+                    mimetypes.guess_type(upload_asset.upload_name)[0]
+                    or "application/octet-stream"
                 )
-    except httpx.TimeoutException as exc:
-        raise click.ClickException(
-            f"Timed out submitting parsing task to {task_url}. "
-            "The server may still be starting up or initializing the model."
-        ) from exc
+                file_handle = stack.enter_context(open(upload_asset.path, "rb"))
+                files.append(
+                    (
+                        "files",
+                        (
+                            upload_asset.upload_name,
+                            file_handle,
+                            mime_type,
+                        ),
+                    )
+                )
+
+            response = sync_client.post(
+                f"{base_url}{TASKS_ENDPOINT}",
+                data=form_data,
+                files=files,
+            )
 
     if response.status_code != 202:
         raise click.ClickException(
@@ -958,23 +960,47 @@ async def download_result_zip(
     submit_response: SubmitResponse,
     task_label: str,
 ) -> Path:
-    response = await client.get(submit_response.result_url)
-    if response.status_code != 200:
-        raise click.ClickException(
-            f"Failed to download result ZIP for task {submit_response.task_id}: "
-            f"{response.status_code} {response_detail(response)}"
-        )
-    content_type = response.headers.get("content-type", "")
-    if "application/zip" not in content_type:
-        raise click.ClickException(
-            f"Expected a ZIP result for {task_label}, "
-            f"got content-type={content_type or 'unknown'}"
-        )
-
     zip_fd, zip_path = tempfile.mkstemp(suffix=".zip", prefix="mineru_cli_result_")
     os.close(zip_fd)
-    Path(zip_path).write_bytes(response.content)
-    return Path(zip_path)
+    zip_file_path = Path(zip_path)
+    try:
+        async with client.stream(
+            "GET",
+            submit_response.result_url,
+            timeout=build_result_download_timeout(),
+        ) as response:
+            if response.status_code != 200:
+                await response.aread()
+                raise click.ClickException(
+                    f"Failed to download result ZIP for task {submit_response.task_id}: "
+                    f"{response.status_code} {response_detail(response)}"
+                )
+            content_type = response.headers.get("content-type", "")
+            if "application/zip" not in content_type:
+                raise click.ClickException(
+                    f"Expected a ZIP result for {task_label}, "
+                    f"got content-type={content_type or 'unknown'}"
+                )
+
+            with open(zip_file_path, "wb") as handle:
+                async for chunk in response.aiter_bytes():
+                    handle.write(chunk)
+    except click.ClickException:
+        zip_file_path.unlink(missing_ok=True)
+        raise
+    except httpx.TimeoutException as exc:
+        zip_file_path.unlink(missing_ok=True)
+        raise click.ClickException(
+            f"Timed out downloading result ZIP for task {submit_response.task_id} "
+            f"for {task_label}"
+        ) from exc
+    except asyncio.CancelledError:
+        zip_file_path.unlink(missing_ok=True)
+        raise
+    except Exception:
+        zip_file_path.unlink(missing_ok=True)
+        raise
+    return zip_file_path
 
 
 def safe_extract_zip(zip_path: Path, output_dir: Path) -> None:
