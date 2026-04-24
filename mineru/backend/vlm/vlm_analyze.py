@@ -1,5 +1,7 @@
 # Copyright (c) Opendatalab. All rights reserved.
 import asyncio
+import atexit
+import gc
 import os
 import time
 import json
@@ -17,8 +19,12 @@ from .model_output_to_middle_json import (
     finalize_middle_json,
     init_middle_json,
 )
+from mineru.backend.utils.runtime_utils import exclude_progress_bar_idle_time
 from ...data.data_reader_writer import DataWriter
-from mineru.utils.pdf_image_tools import load_images_from_pdf_doc
+from mineru.utils.pdf_image_tools import (
+    aio_load_images_from_pdf_bytes_range,
+    load_images_from_pdf_doc,
+)
 from ...utils.check_sys_env import is_mac_os_version_supported
 from ...utils.config_reader import get_device, get_processing_window_size
 
@@ -103,11 +109,8 @@ class ModelSingleton:
                     mlx_supported = is_mac_os_version_supported()
                     if not mlx_supported:
                         raise EnvironmentError("mlx-engine backend is only supported on macOS 13.5+ with Apple Silicon.")
-                    try:
-                        from mlx_vlm import load as mlx_load
-                    except ImportError:
-                        raise ImportError("Please install mlx-vlm to use the mlx-engine backend.")
-                    model, processor = mlx_load(model_path)
+                    from mineru_vl_utils.mlx_compat import load_mlx_model
+                    model, processor = load_mlx_model(model_path)
                 else:
                     if os.getenv('OMP_NUM_THREADS') is None:
                         os.environ["OMP_NUM_THREADS"] = "1"
@@ -230,12 +233,140 @@ class ModelSingleton:
                     server_headers=server_headers,
                     max_retries=max_retries,
                     retry_backoff_factor=retry_backoff_factor,
+                    enable_table_formula_eq_wrap=True,
+                    image_analysis=True,
+                    enable_cross_page_table_merge=True,
                 )
+                predictor._mineru_runtime_handles = {
+                    "backend": backend,
+                    "model": model,
+                    "processor": processor,
+                    "vllm_llm": vllm_llm,
+                    "vllm_async_llm": vllm_async_llm,
+                    "lmdeploy_engine": lmdeploy_engine,
+                }
                 _maybe_enable_serial_execution(predictor, backend)
                 self._models[key] = predictor
                 elapsed = round(time.time() - start_time, 2)
                 logger.info(f"get {backend} predictor cost: {elapsed}s")
         return self._models[key]
+
+    def shutdown(self) -> None:
+        with self._lock:
+            predictors = list(self._models.values())
+            self._models.clear()
+
+        for predictor in predictors:
+            _shutdown_predictor_runtime(predictor)
+
+        gc.collect()
+
+
+async def _get_model_async(
+    backend: str,
+    model_path: str | None,
+    server_url: str | None,
+    **kwargs,
+) -> MinerUClient:
+    return await asyncio.to_thread(
+        ModelSingleton().get_model,
+        backend,
+        model_path,
+        server_url,
+        **kwargs,
+    )
+
+
+def _iter_shutdown_candidates(predictor: MinerUClient):
+    runtime_handles = getattr(predictor, "_mineru_runtime_handles", {})
+    client = getattr(predictor, "client", None)
+
+    seen_ids = set()
+
+    def _yield_candidate(candidate):
+        if candidate is None:
+            return
+        candidate_id = id(candidate)
+        if candidate_id in seen_ids:
+            return
+        seen_ids.add(candidate_id)
+        yield candidate
+
+    for key in ("vllm_llm", "vllm_async_llm", "lmdeploy_engine", "model"):
+        yield from _yield_candidate(runtime_handles.get(key))
+
+    if client is not None:
+        for key in ("vllm_llm", "vllm_async_llm", "lmdeploy_engine", "model"):
+            yield from _yield_candidate(getattr(client, key, None))
+
+
+def _call_nested_shutdown(target, method_path: str, label: str) -> bool:
+    current = target
+    for attr in method_path.split("."):
+        current = getattr(current, attr, None)
+        if current is None:
+            return False
+
+    if not callable(current):
+        return False
+
+    try:
+        current()
+        logger.debug(f"Shutdown {label} via `{method_path}`")
+        return True
+    except TypeError:
+        logger.debug(f"Skip unsupported shutdown call {label}.{method_path}")
+        return False
+    except Exception as exc:
+        logger.debug(f"Failed to shutdown {label} via `{method_path}`: {exc}")
+        return False
+
+
+def _shutdown_runtime_handle(handle) -> None:
+    for method_path in (
+        "shutdown",
+        "close",
+        "stop",
+        "terminate",
+        "destroy",
+        "engine.shutdown",
+        "engine.close",
+        "engine_core.shutdown",
+        "engine_core.close",
+        "llm_engine.shutdown",
+        "llm_engine.close",
+        "llm_engine.model_executor.shutdown",
+        "llm_engine.model_executor.close",
+        "model_executor.shutdown",
+        "model_executor.close",
+    ):
+        if _call_nested_shutdown(handle, method_path, type(handle).__name__):
+            return
+
+
+def _clear_predictor_references(predictor: MinerUClient) -> None:
+    runtime_handles = getattr(predictor, "_mineru_runtime_handles", {})
+    for key in tuple(runtime_handles.keys()):
+        runtime_handles[key] = None
+
+    client = getattr(predictor, "client", None)
+    if client is not None:
+        for attr in ("vllm_llm", "vllm_async_llm", "lmdeploy_engine", "model", "processor"):
+            if hasattr(client, attr):
+                setattr(client, attr, None)
+
+
+def _shutdown_predictor_runtime(predictor: MinerUClient) -> None:
+    for handle in _iter_shutdown_candidates(predictor):
+        _shutdown_runtime_handle(handle)
+    _clear_predictor_references(predictor)
+
+
+def shutdown_cached_models() -> None:
+    ModelSingleton().shutdown()
+
+
+atexit.register(shutdown_cached_models)
 
 
 def _predictor_uses_mlx(predictor: MinerUClient, backend: str | None = None) -> bool:
@@ -321,7 +452,9 @@ def doc_analyze(
         )
 
         infer_start = time.time()
-        with tqdm(total=page_count, desc="Processing pages") as progress_bar:
+        progress_bar = None
+        last_append_end_time = None
+        try:
             for window_index, window_start in enumerate(range(0, page_count, effective_window_size or 1)):
                 window_end = min(page_count - 1, window_start + effective_window_size - 1)
                 images_list = load_images_from_pdf_doc(
@@ -329,6 +462,7 @@ def doc_analyze(
                     start_page_id=window_start,
                     end_page_id=window_end,
                     image_type=ImageType.PIL,
+                    pdf_bytes=pdf_bytes,
                 )
                 try:
                     images_pil_list = [image_dict["img_pil"] for image_dict in images_list]
@@ -340,6 +474,14 @@ def doc_analyze(
                     with predictor_execution_guard(predictor):
                         window_results = predictor.batch_two_step_extract(images=images_pil_list)
                     results.extend(window_results)
+                    if progress_bar is None:
+                        progress_bar = tqdm(total=page_count, desc="Processing pages")
+                    else:
+                        exclude_progress_bar_idle_time(
+                            progress_bar,
+                            last_append_end_time,
+                            now=time.time(),
+                        )
                     append_page_blocks_to_middle_json(
                         middle_json,
                         window_results,
@@ -349,8 +491,12 @@ def doc_analyze(
                         page_start_index=window_start,
                         progress_bar=progress_bar,
                     )
+                    last_append_end_time = time.time()
                 finally:
                     _close_images(images_list)
+        finally:
+            if progress_bar is not None:
+                progress_bar.close()
         infer_time = round(time.time() - infer_start, 2)
         if infer_time > 0 and page_count > 0:
             logger.debug(
@@ -376,7 +522,7 @@ async def aio_doc_analyze(
     **kwargs,
 ):
     if predictor is None:
-        predictor = ModelSingleton().get_model(backend, model_path, server_url, **kwargs)
+        predictor = await _get_model_async(backend, model_path, server_url, **kwargs)
     predictor = _maybe_enable_serial_execution(predictor, backend)
 
     pdf_doc = open_pdfium_document(pdfium.PdfDocument, pdf_bytes)
@@ -398,11 +544,13 @@ async def aio_doc_analyze(
         )
 
         infer_start = time.time()
-        with tqdm(total=page_count, desc="Processing pages") as progress_bar:
+        progress_bar = None
+        last_append_end_time = None
+        try:
             for window_index, window_start in enumerate(range(0, page_count, effective_window_size or 1)):
                 window_end = min(page_count - 1, window_start + effective_window_size - 1)
-                images_list = load_images_from_pdf_doc(
-                    pdf_doc,
+                images_list = await aio_load_images_from_pdf_bytes_range(
+                    pdf_bytes,
                     start_page_id=window_start,
                     end_page_id=window_end,
                     image_type=ImageType.PIL,
@@ -417,6 +565,14 @@ async def aio_doc_analyze(
                     async with aio_predictor_execution_guard(predictor):
                         window_results = await predictor.aio_batch_two_step_extract(images=images_pil_list)
                     results.extend(window_results)
+                    if progress_bar is None:
+                        progress_bar = tqdm(total=page_count, desc="Processing pages")
+                    else:
+                        exclude_progress_bar_idle_time(
+                            progress_bar,
+                            last_append_end_time,
+                            now=time.time(),
+                        )
                     append_page_blocks_to_middle_json(
                         middle_json,
                         window_results,
@@ -426,8 +582,12 @@ async def aio_doc_analyze(
                         page_start_index=window_start,
                         progress_bar=progress_bar,
                     )
+                    last_append_end_time = time.time()
                 finally:
                     _close_images(images_list)
+        finally:
+            if progress_bar is not None:
+                progress_bar.close()
         infer_time = round(time.time() - infer_start, 2)
         if infer_time > 0 and page_count > 0:
             logger.debug(
