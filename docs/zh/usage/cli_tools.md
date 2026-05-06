@@ -23,6 +23,9 @@ Options:
   -t, --table BOOLEAN             是否启用表格解析（默认开启）
   --help                          显示帮助信息
 ```
+> [!TIP]
+> `mineru` 当前支持本地 `PDF`、图片与 `DOCX`、`PPTX`、`XLSX` 文件或目录输入。
+
 ```bash
 mineru-api --help
 Usage: mineru-api [OPTIONS]
@@ -31,6 +34,8 @@ Options:
   --host TEXT     服务器主机地址（默认：127.0.0.1）
   --port INTEGER  服务器端口（默认：8000）
   --reload        启用自动重载（开发模式）
+  --enable-vlm-preload BOOLEAN
+                  在 mineru-api 启动阶段预加载本地 VLM 模型
   --help          显示此帮助信息并退出
 ```
 ```bash
@@ -45,20 +50,41 @@ Options:
   --max-convert-pages INTEGER     设置从 PDF 转换为 Markdown 的最大页数
   --server-name TEXT              设置 Gradio 应用程序的服务器主机名
   --server-port INTEGER           设置 Gradio 应用程序的服务器端口
+  --api-url TEXT                  MinerU FastAPI 服务地址；不传时自动拉起可复用的本地
+                                  mineru-api
+  --enable-vlm-preload BOOLEAN    在 Gradio 拉起本地 mineru-api 时预加载本地
+                                  VLM 模型
   --latex-delimiters-type [a|b|all]
                                   设置在 Markdown 渲染中使用的 LaTeX 分隔符类型
                                   ('a' 表示 '$' 类型，'b' 表示 '()[]' 类型，
                                   'all' 表示两种类型都使用)
   --help                          显示此帮助信息并退出
 ```
+```bash
+mineru-router --help
+Usage: mineru-router [OPTIONS]
+
+Options:
+  --host TEXT             路由服务主机地址（默认：127.0.0.1）
+  --port INTEGER          路由服务端口（默认：8002）
+  --reload                启用自动重载（开发模式）
+  --upstream-url TEXT     现有 MinerU FastAPI 服务地址；可重复传入多个
+  --local-gpus TEXT       本地 GPU worker 配置：auto、none 或 0,1,2 形式
+  --worker-host TEXT      路由托管 worker 的监听地址（默认：127.0.0.1）
+  --enable-vlm-preload BOOLEAN
+                          在 router 托管的本地 mineru-api worker 中预加载本地
+                          VLM 模型
+  --help                  显示此帮助信息并退出
+```
 
 ## 环境变量说明
 
 > [!NOTE]
 > 从当前版本开始，`mineru` 是基于 `mineru-api` 的编排客户端：
-> - 未传 `--api-url` 时，CLI 会自动拉起本地临时 `mineru-api`
-> - 传入 `--api-url` 时，CLI 会直连该 FastAPI 服务
-> - `--url` 不再表示 MinerU API 地址，而是服务端 `vlm/hybrid-http-client` 所需的 OpenAI 兼容地址
+> 
+>- 未传 `--api-url` 时，CLI 会自动拉起本地临时 `mineru-api`
+>- 传入 `--api-url` 时，CLI 会直连该 FastAPI 服务
+>- `--url` 不再表示 MinerU API 地址，而是服务端 `vlm/hybrid-http-client` 所需的 OpenAI 兼容地址
 
 MinerU命令行工具的某些参数存在相同功能的环境变量配置，通常环境变量配置的优先级高于命令行参数，且在所有命令行工具中都生效。
 以下是常用的环境变量及其说明： 
@@ -87,12 +113,51 @@ MinerU命令行工具的某些参数存在相同功能的环境变量配置，�
 - `MINERU_PDF_RENDER_TIMEOUT`：
     * 用于设置将PDF渲染为图片的超时时间（秒）
     * 默认为`300`秒，可通过环境变量设置为其他值以调整渲染图片的超时时间。
-    * 仅在linux和macOS系统中生效。
+    * 在 Linux、macOS 和 Windows 系统中生效。
 
 - `MINERU_PDF_RENDER_THREADS`：
-    * 用于设置将PDF渲染为图片时使用的线程数
-    * 默认为`4`，可通过环境变量设置为其他值以调整渲染图片时的线程数。
-    * 仅在linux和macOS系统中生效。
+    * 用于设置将PDF渲染为图片时使用的渲染 worker 并发数
+    * 默认为`4`，可通过环境变量设置为其他值以调整渲染 worker 并发数。
+    * 在 Linux、macOS 和 Windows 系统中生效。
+
+- `MINERU_PROCESSING_WINDOW_SIZE`：
+    * 用于设置单次处理窗口大小，影响大文档处理时的内存占用和吞吐表现
+    * 默认为`64`，可通过环境变量设置为其他正整数。
+
+- `MINERU_API_MAX_CONCURRENT_REQUESTS`：
+    * 用于设置 `mineru-api` 或 `mineru-router` 管理的 worker 最大并发请求数
+    * 默认为`3`，需设置为正整数。
+
+- `MINERU_API_ENABLE_FASTAPI_DOCS`：
+    * 用于控制是否启用 FastAPI 自动生成的 `/docs`、`/openapi.json`、`/redoc`
+    * 默认为`true`。
+
+- `MINERU_API_OUTPUT_ROOT`：
+    * 用于指定 `mineru-api` 输出目录根路径
+    * 默认为当前工作目录下的 `./output`。
+
+- `MINERU_LOCAL_API_STARTUP_TIMEOUT_SECONDS`：
+    * 用于控制各命令行工具等待本地拉起的 `mineru-api` 进入健康状态的最长时间
+    * 默认为 `300` 秒。
+    * 适用于 `mineru` 的临时本地 API、`mineru-gradio` 的 preload 启动，以及 `mineru-router` 托管的本地 worker。
+
+- `MINERU_TASK_RESULT_TIMEOUT_SECONDS`：
+    * 用于控制客户端等待任务完成并进入终态的最长时间。
+    * 默认为 `3600` 秒，需设置为大于等于 `1` 的数值。
+    * 适用于 `mineru`、`mineru-gradio` 和 `mineru-router` 等通过 API 客户端轮询任务状态的场景。
+
+- `MINERU_TASK_RESULT_DOWNLOAD_TIMEOUT_SECONDS`：
+    * 用于控制任务完成后获取结果的读取超时时间，包括服务端生成 ZIP 的等待和结果 ZIP 下载。
+    * 默认为 `600` 秒，需设置为大于等于 `1` 的数值。
+    * 该配置不代表整个下载过程的总耗时硬上限；如果服务端持续返回数据，整体下载时间可能超过该值。
+
+- `MINERU_API_TASK_RETENTION_SECONDS`：
+    * 用于设置任务完成或失败后的保留时长（秒）
+    * 默认为 `86400` 秒（24 小时）。
+
+- `MINERU_API_TASK_CLEANUP_INTERVAL_SECONDS`：
+    * 用于设置任务清理轮询间隔（秒）
+    * 默认为 `300` 秒（5 分钟）。
 
 - `MINERU_INTRA_OP_NUM_THREADS`：
     * 用于设置onnx模型的intra_op线程数，影响单个算子的计算速度
@@ -108,9 +173,9 @@ MinerU命令行工具的某些参数存在相同功能的环境变量配置，�
     * 单个client端显存大小 | MINERU_HYBRID_BATCH_RATIO
       ------------------|------------------------
       <= 6   GB         | 8
-      <= 4.5 GB         | 4
+      <= 4   GB         | 4
       <= 3   GB         | 2
-      <= 2.5 GB         | 1
+      <= 2   GB         | 1
 
 - `MINERU_HYBRID_FORCE_PIPELINE_ENABLE`：
     * 用于强制将 hybrid-* 后端中的 文本提取部分使用 小模型 进行处理

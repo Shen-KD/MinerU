@@ -23,6 +23,9 @@ Options:
   -t, --table BOOLEAN             Enable table parsing (default: enabled)
   --help                          Show help information
 ```
+> [!TIP]
+> `mineru` currently supports local `PDF`, image, `DOCX`, `PPTX`, and `XLSX` file or directory inputs.
+
 ```bash
 mineru-api --help
 Usage: mineru-api [OPTIONS]
@@ -31,6 +34,8 @@ Options:
   --host TEXT     Server host (default: 127.0.0.1)
   --port INTEGER  Server port (default: 8000)
   --reload        Enable auto-reload (development mode)
+  --enable-vlm-preload BOOLEAN
+                  Preload the local VLM model during mineru-api startup.
   --help          Show this message and exit.
 ```
 ```bash
@@ -50,20 +55,42 @@ Options:
                                   from PDF to Markdown.
   --server-name TEXT              Set the server name for the Gradio app.
   --server-port INTEGER           Set the server port for the Gradio app.
+  --api-url TEXT                  MinerU FastAPI base URL. If omitted, gradio
+                                  starts a reusable local mineru-api service.
+  --enable-vlm-preload BOOLEAN    Preload the local VLM model when gradio
+                                  starts a local mineru-api service.
   --latex-delimiters-type [a|b|all]
                                   Set the type of LaTeX delimiters to use in
                                   Markdown rendering: 'a' for type '$', 'b' for
                                   type '()[]', 'all' for both types.
   --help                          Show this message and exit.
 ```
+```bash
+mineru-router --help
+Usage: mineru-router [OPTIONS]
+
+Options:
+  --host TEXT             Server host (default: 127.0.0.1)
+  --port INTEGER          Server port (default: 8002)
+  --reload                Enable auto-reload (development mode)
+  --upstream-url TEXT     Existing MinerU FastAPI base URL; repeat to add more
+  --local-gpus TEXT       Local GPU workers to launch: auto, none, or CSV such
+                          as 0,1,2
+  --worker-host TEXT      Host for router-managed workers (default: 127.0.0.1)
+  --enable-vlm-preload BOOLEAN
+                          Preload the local VLM model in router-managed
+                          mineru-api workers.
+  --help                  Show this message and exit.
+```
 
 ## Environment Variables Description
 
 > [!NOTE]
 > Starting from this version, `mineru` is an orchestration client built on top of `mineru-api`:
-> - Without `--api-url`, the CLI launches a temporary local `mineru-api`
-> - With `--api-url`, the CLI connects to that FastAPI service directly
-> - `--url` is no longer the MinerU API address; it is the OpenAI-compatible backend URL used by server-side `vlm/hybrid-http-client`
+> 
+>- Without `--api-url`, the CLI launches a temporary local `mineru-api`
+>- With `--api-url`, the CLI connects to that FastAPI service directly
+>- `--url` is no longer the MinerU API address; it is the OpenAI-compatible backend URL used by server-side `vlm/hybrid-http-client`
 
 Some parameters of MinerU command line tools have equivalent environment variable configurations. Generally, environment variable configurations have higher priority than command line parameters and take effect across all command line tools.
 Here are the environment variables and their descriptions:
@@ -92,12 +119,51 @@ Here are the environment variables and their descriptions:
 - `MINERU_PDF_RENDER_TIMEOUT`:
     * Used to set the timeout (in seconds) for rendering PDFs to images.
     * Default is `300` seconds; you can set a different value via an environment variable to adjust the rendering timeout.
-    * Only effective on Linux and macOS systems.
+    * Effective on Linux, macOS, and Windows.
 
 - `MINERU_PDF_RENDER_THREADS`:
-    * Used to set the number of threads used when rendering PDFs to images.
-    * Default is `4`; you can set a different value via an environment variable to adjust the number of threads for image rendering.
-    * Only effective on Linux and macOS systems.
+    * Used to set the render worker concurrency used when rendering PDFs to images.
+    * Default is `4`; you can set a different value via an environment variable to adjust render worker concurrency.
+    * Effective on Linux, macOS, and Windows.
+
+- `MINERU_PROCESSING_WINDOW_SIZE`:
+    * Used to control the processing window size, which affects memory use and throughput on large-document workloads.
+    * Default is `64`; set it to another positive integer when needed.
+
+- `MINERU_API_MAX_CONCURRENT_REQUESTS`:
+    * Used to control the maximum concurrent requests handled by `mineru-api` or router-managed workers.
+    * Default is `3`, and it must be a positive integer.
+
+- `MINERU_API_ENABLE_FASTAPI_DOCS`:
+    * Used to control whether FastAPI documentation endpoints such as `/docs`, `/openapi.json`, and `/redoc` are enabled.
+    * Default is `true`.
+
+- `MINERU_API_OUTPUT_ROOT`:
+    * Used to configure the root output directory for `mineru-api`.
+    * Default is `./output` under the current working directory.
+
+- `MINERU_LOCAL_API_STARTUP_TIMEOUT_SECONDS`:
+    * Used to control how long CLI tools wait for a locally started `mineru-api` to become healthy.
+    * Default is `300` seconds.
+    * Applies to temporary local API startup in `mineru`, preload startup in `mineru-gradio`, and router-managed local workers.
+
+- `MINERU_TASK_RESULT_TIMEOUT_SECONDS`:
+    * Used to control how long clients wait for a task to complete and reach a terminal state.
+    * Default is `3600` seconds, and the value must be greater than or equal to `1`.
+    * Applies to task-status polling in `mineru`, `mineru-gradio`, `mineru-router`, and other API-client scenarios.
+
+- `MINERU_TASK_RESULT_DOWNLOAD_TIMEOUT_SECONDS`:
+    * Used to control the read timeout when retrieving completed task results, including waiting for server-side ZIP generation and downloading the result ZIP.
+    * Default is `600` seconds, and the value must be greater than or equal to `1`.
+    * This is not a hard limit for total download duration; if the server keeps returning data, the total download time may exceed this value.
+
+- `MINERU_API_TASK_RETENTION_SECONDS`:
+    * Used to set how long completed or failed tasks are retained, in seconds.
+    * Default is `86400` seconds (24 hours).
+
+- `MINERU_API_TASK_CLEANUP_INTERVAL_SECONDS`:
+    * Used to set the cleanup polling interval for expired tasks, in seconds.
+    * Default is `300` seconds (5 minutes).
 
 - `MINERU_INTRA_OP_NUM_THREADS`:
     * Used to set the intra_op thread count for ONNX models, affects the computation speed of individual operators
@@ -113,9 +179,9 @@ Here are the environment variables and their descriptions:
     * Single Client VRAM Size | MINERU_HYBRID_BATCH_RATIO
       ------------------------|--------------------------
       <= 6   GB               | 8
-      <= 4.5 GB               | 4
+      <= 4   GB               | 4
       <= 3   GB               | 2
-      <= 2.5 GB               | 1
+      <= 2   GB               | 1
 
 - `MINERU_HYBRID_FORCE_PIPELINE_ENABLE`:
     * Used to force the text extraction part in `hybrid-*` backends to be processed using small models.
