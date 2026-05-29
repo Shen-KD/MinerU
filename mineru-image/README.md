@@ -49,9 +49,10 @@ MINERU_EXTRAS=core ./mineru-image/build.sh china
 docker build -t mineru-source:v2.7.4-fix -f mineru-image/source/Dockerfile .
 docker run --rm mineru-source:v2.7.4-fix ls -la /src/pyproject.toml
 
-# 2. 运行时镜像
+# 2. 运行时镜像（需已有含模型的镜像，默认 mineru-vllm:v2.7.4-fix）
 docker build -t mineru-core:v2.7.4-fix \
   --build-arg SOURCE_IMAGE=mineru-source:v2.7.4-fix \
+  --build-arg MODELS_IMAGE=mineru-vllm:v2.7.4-fix \
   --build-arg MINERU_EXTRAS=core \
   -f mineru-image/runtime/Dockerfile.china .
 ```
@@ -73,3 +74,18 @@ docker compose -f mineru-image/compose.yaml --profile gradio up -d
 | entrypoint | 官方 bash wrapper | **相同，未修改** |
 
 生产若仍要用 PyPI 版，继续用 `docker/china/Dockerfile` 即可。
+
+### 模型来源（Dockerfile.china）
+
+构建 runtime 时不再执行 `mineru-models-download`，而是从已有镜像复制：
+
+- 默认 `MODELS_IMAGE=mineru-vllm:v2.7.4-fix`（需事先用官方 `docker/china/Dockerfile` 或等价镜像打好模型）
+- 复制 `/root/mineru.json` 及 `models-dir` 指向的目录
+
+```bash
+# 先构建/准备模型镜像（只需一次）
+docker build -t mineru-vllm:v2.7.4-fix -f docker/china/Dockerfile .
+
+# 再构建源码 runtime
+MODELS_TAG=mineru-vllm:v2.7.4-fix ./mineru-image/build.sh china
+```

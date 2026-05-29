@@ -255,9 +255,14 @@ def create_app():
 
     _configured_max_concurrent_requests = max_concurrent_requests
     app.state.max_concurrent_requests = max_concurrent_requests
-    _request_semaphore = asyncio.Semaphore(max_concurrent_requests)
-    if is_main_multiprocessing_process():
-        logger.info(f"Request concurrency limited to {max_concurrent_requests}")
+    if max_concurrent_requests > 0:
+        _request_semaphore = asyncio.Semaphore(max_concurrent_requests)
+        if is_main_multiprocessing_process():
+            logger.info(f"Request concurrency limited to {max_concurrent_requests}")
+    else:
+        _request_semaphore = None
+        if is_main_multiprocessing_process():
+            logger.info("Request concurrency unlimited (MINERU_API_MAX_CONCURRENT_REQUESTS=0)")
 
     app.add_middleware(GZipMiddleware, minimum_size=1000)
     app.state.public_bind_exposed = env_flag_enabled(

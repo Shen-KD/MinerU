@@ -4,9 +4,11 @@
 # ARGs used in FROM must be declared before the first FROM.
 ARG UV_VERSION=0.7.13
 ARG SOURCE_IMAGE=mineru-src:latest
+ARG MODELS_IMAGE=mineru-vllm:v2.7.4-fix
 
 FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
 FROM ${SOURCE_IMAGE} AS src
+FROM ${MODELS_IMAGE} AS models
 
 FROM docker.m.daocloud.io/vllm/vllm-openai:v0.10.1.1
 
@@ -37,6 +39,18 @@ RUN --mount=type=bind,from=src,source=/src,target=/mnt/src,readonly \
       cp -a /mnt/src /tmp/mineru-src; \
       uv pip install --system --index-url "${UV_INDEX_URL}" "/tmp/mineru-src[${MINERU_EXTRAS}]"; \
       rm -rf /tmp/mineru-src \
+    '
+
+# Reuse models + mineru.json from a pre-built image (e.g. official PyPI image),
+# instead of downloading again during build.
+RUN --mount=type=bind,from=models,source=/root,target=/mnt/models,readonly \
+    sh -ec '\
+      test -f /mnt/models/mineru.json || (echo "models image missing /root/mineru.json; set MODELS_IMAGE to an image with downloaded models" >&2; exit 1); \
+      cp -a /mnt/models/mineru.json /root/mineru.json; \
+      if [ -d /mnt/models/.cache ]; then \
+        mkdir -p /root/.cache; \
+        cp -a /mnt/models/.cache/. /root/.cache/; \
+      fi \
     '
 
 ENTRYPOINT ["/bin/bash", "-c", "export MINERU_MODEL_SOURCE=local && exec \"$@\"", "--"]
