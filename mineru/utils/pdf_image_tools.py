@@ -1,6 +1,9 @@
 # Copyright (c) Opendatalab. All rights reserved.
+import asyncio
+import atexit
+import multiprocessing
 import os
-import signal
+import threading
 import time
 from io import BytesIO
 
@@ -25,12 +28,18 @@ from mineru.utils.pdfium_guard import (
 )
 
 from concurrent.futures import ProcessPoolExecutor, wait, ALL_COMPLETED
+from concurrent.futures.process import BrokenProcessPool
 
 
 DEFAULT_PDF_IMAGE_DPI = 200
 # DEFAULT_PDF_IMAGE_DPI = 144
-MAX_PDF_RENDER_PROCESSES = 4
+MAX_PDF_RENDER_PROCESSES = 3
 MIN_PAGES_PER_RENDER_PROCESS = 30
+PDF_RENDER_TERMINATE_GRACE_PERIOD_SECONDS = 0.1
+PDF_RENDER_KILL_JOIN_TIMEOUT_SECONDS = 0.1
+
+_pdf_render_executor: ProcessPoolExecutor | None = None
+_pdf_render_executor_lock = threading.Lock()
 
 
 def pdf_page_to_image(
@@ -113,6 +122,82 @@ def _get_render_process_plan(
     )
 
 
+def _get_pdf_render_pool_capacity(cpu_count=None) -> int:
+    available_cpus = max(1, cpu_count if cpu_count is not None else (os.cpu_count() or 1))
+    configured_threads = max(1, get_load_images_threads())
+    return min(
+        available_cpus,
+        configured_threads,
+        MAX_PDF_RENDER_PROCESSES,
+    )
+
+
+def _create_pdf_render_executor(max_workers: int) -> ProcessPoolExecutor:
+    if is_windows_environment():
+        return ProcessPoolExecutor(max_workers=max_workers)
+
+    start_method = multiprocessing.get_start_method()
+    if start_method == "fork":
+        logger.debug(
+            "PDF image rendering switches multiprocessing start method from fork to spawn"
+        )
+        return ProcessPoolExecutor(
+            max_workers=max_workers,
+            mp_context=multiprocessing.get_context("spawn"),
+        )
+
+    return ProcessPoolExecutor(max_workers=max_workers)
+
+
+def _get_pdf_render_executor() -> ProcessPoolExecutor:
+    global _pdf_render_executor
+
+    with _pdf_render_executor_lock:
+        if _pdf_render_executor is None:
+            max_workers = _get_pdf_render_pool_capacity()
+            _pdf_render_executor = _create_pdf_render_executor(max_workers=max_workers)
+            logger.debug(
+                f"Created persistent PDF render executor with max_workers={max_workers}"
+            )
+        return _pdf_render_executor
+
+
+def _recycle_pdf_render_executor(
+    executor: ProcessPoolExecutor | None,
+    *,
+    terminate_processes: bool,
+) -> None:
+    global _pdf_render_executor
+
+    if executor is None:
+        return
+
+    with _pdf_render_executor_lock:
+        if _pdf_render_executor is executor:
+            _pdf_render_executor = None
+
+    if terminate_processes:
+        _terminate_executor_processes(executor)
+    executor.shutdown(wait=False, cancel_futures=True)
+
+
+def shutdown_pdf_render_executor() -> None:
+    global _pdf_render_executor
+
+    with _pdf_render_executor_lock:
+        executor = _pdf_render_executor
+        _pdf_render_executor = None
+
+    if executor is not None:
+        _recycle_pdf_render_executor(
+            executor,
+            terminate_processes=True,
+        )
+
+
+atexit.register(shutdown_pdf_render_executor)
+
+
 def _load_images_from_pdf_bytes_range(
     pdf_bytes: bytes,
     dpi=DEFAULT_PDF_IMAGE_DPI,
@@ -141,7 +226,8 @@ def _load_images_from_pdf_bytes_range(
         f"{start_page_id + 1}-{end_page_id + 1}: {page_ranges}"
     )
 
-    executor = ProcessPoolExecutor(max_workers=actual_threads)
+    executor = _get_pdf_render_executor()
+    recycle_executor = False
     try:
         futures = []
         future_to_range = {}
@@ -159,7 +245,7 @@ def _load_images_from_pdf_bytes_range(
 
         _, not_done = wait(futures, timeout=timeout, return_when=ALL_COMPLETED)
         if not_done:
-            _terminate_executor_processes(executor)
+            recycle_executor = True
             raise TimeoutError(
                 f"PDF image rendering timeout after {timeout}s "
                 f"for pages {start_page_id + 1}-{end_page_id + 1}"
@@ -177,35 +263,82 @@ def _load_images_from_pdf_bytes_range(
             images_list.extend(imgs)
 
         return images_list
-    except Exception as exc:
-        if not isinstance(exc, TimeoutError):
-            _terminate_executor_processes(executor)
+    except BrokenProcessPool:
+        recycle_executor = True
         raise
     finally:
-        executor.shutdown(wait=False, cancel_futures=True)
+        if recycle_executor:
+            logger.warning("Recycling persistent PDF render executor after render failure")
+            _recycle_pdf_render_executor(
+                executor,
+                terminate_processes=True,
+            )
+
+
+async def aio_load_images_from_pdf_bytes_range(
+    pdf_bytes: bytes,
+    dpi=DEFAULT_PDF_IMAGE_DPI,
+    start_page_id=0,
+    end_page_id=0,
+    image_type=ImageType.PIL,
+    timeout=None,
+    threads=None,
+):
+    return await asyncio.to_thread(
+        _load_images_from_pdf_bytes_range,
+        pdf_bytes,
+        dpi=dpi,
+        start_page_id=start_page_id,
+        end_page_id=end_page_id,
+        image_type=image_type,
+        timeout=timeout,
+        threads=threads,
+    )
 
 
 def _terminate_executor_processes(executor):
     """强制终止 ProcessPoolExecutor 中的所有子进程"""
-    if hasattr(executor, '_processes'):
-        for pid, process in executor._processes.items():
-            if process.is_alive():
-                try:
-                    # 先发送 SIGTERM 允许优雅退出
-                    os.kill(pid, signal.SIGTERM)
-                except (ProcessLookupError, OSError):
-                    pass
+    processes = list(getattr(executor, "_processes", {}).values())
+    if not processes:
+        return
 
-        # 给子进程一点时间响应 SIGTERM
-        time.sleep(0.1)
+    alive_processes = []
+    for process in processes:
+        if not process.is_alive():
+            continue
+        try:
+            process.terminate()
+        except Exception:
+            pass
+        alive_processes.append(process)
 
-        # 对仍然存活的进程发送 SIGKILL 强制终止
-        for pid, process in executor._processes.items():
-            if process.is_alive():
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except (ProcessLookupError, OSError):
-                    pass
+    deadline = time.monotonic() + PDF_RENDER_TERMINATE_GRACE_PERIOD_SECONDS
+    for process in alive_processes:
+        remaining = max(0.0, deadline - time.monotonic())
+        try:
+            process.join(timeout=remaining)
+        except Exception:
+            pass
+
+    for process in alive_processes:
+        if not process.is_alive():
+            continue
+        try:
+            kill_process = getattr(process, "kill", None)
+            if callable(kill_process):
+                kill_process()
+            else:
+                process.terminate()
+        except Exception:
+            pass
+
+    for process in alive_processes:
+        if not process.is_alive():
+            continue
+        try:
+            process.join(timeout=PDF_RENDER_KILL_JOIN_TIMEOUT_SECONDS)
+        except Exception:
+            pass
 
 
 def load_images_from_pdf_core(
@@ -247,7 +380,7 @@ def load_images_from_pdf_doc(
     pdf_page_num = get_pdfium_document_page_count(pdf_doc)
     normalized_end_page_id = get_end_page_id(end_page_id, pdf_page_num)
 
-    if pdf_bytes is not None and not is_windows_environment():
+    if pdf_bytes is not None:
         return _load_images_from_pdf_bytes_range(
             pdf_bytes,
             dpi=dpi,
