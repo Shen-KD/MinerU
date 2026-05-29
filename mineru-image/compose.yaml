@@ -1,0 +1,105 @@
+# Compose for mineru-runtime image (built via mineru-image/build.sh).
+# Does not override entrypoint — same pattern as docker/compose.yaml.
+
+name: mineru-image
+
+services:
+  mineru-openai-server:
+    image: mineru-runtime:latest
+    container_name: mineru-runtime-openai-server
+    restart: unless-stopped
+    profiles: ["openai-server"]
+    ports:
+      - 30000:30000
+    environment:
+      MINERU_MODEL_SOURCE: local
+    entrypoint: mineru-openai-server
+    command:
+      --host 0.0.0.0
+      --port 30000
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+
+  mineru-api:
+    image: mineru-runtime:latest
+    container_name: mineru-runtime-api
+    restart: unless-stopped
+    profiles: ["api"]
+    ports:
+      - 8000:8000
+    environment:
+      MINERU_MODEL_SOURCE: local
+    entrypoint: mineru-api
+    command:
+      --host 0.0.0.0
+      --port 8000
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+
+  mineru-router:
+    image: mineru-runtime:latest
+    container_name: mineru-runtime-router
+    restart: unless-stopped
+    profiles: ["router"]
+    ports:
+      - 8001:8001
+    environment:
+      MINERU_MODEL_SOURCE: local
+    entrypoint: mineru-router
+    command:
+      --host 0.0.0.0
+      --port 8001
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+
+  mineru-gradio:
+    image: mineru-runtime:latest
+    container_name: mineru-runtime-gradio
+    restart: unless-stopped
+    profiles: ["gradio"]
+    ports:
+      - 7860:7860
+    environment:
+      MINERU_MODEL_SOURCE: local
+    entrypoint: mineru-gradio
+    command:
+      --server-name 0.0.0.0
+      --server-port 7860
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
