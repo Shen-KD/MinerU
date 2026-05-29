@@ -14,10 +14,8 @@ from mineru.utils.enum_class import MakeMode
 from mineru.utils.guess_suffix_or_lang import guess_suffix_by_bytes
 from mineru.utils.pdf_image_tools import images_bytes_to_pdf_bytes
 from mineru.backend.vlm.vlm_middle_json_mkcontent import union_make as vlm_union_make
-from mineru.backend.office.office_middle_json_mkcontent import union_make as office_union_make
 from mineru.backend.vlm.vlm_analyze import doc_analyze as vlm_doc_analyze
 from mineru.backend.vlm.vlm_analyze import aio_doc_analyze as aio_vlm_doc_analyze
-from mineru.backend.office.docx_analyze import office_docx_analyze
 from mineru.utils.pdfium_guard import rewrite_pdf_bytes_with_pdfium
 
 os.environ["TORCH_CUDNN_V8_API_DISABLED"] = "1"
@@ -28,10 +26,11 @@ if os.getenv("MINERU_LMDEPLOY_DEVICE", "") == "maca":
 
 pdf_suffixes = ["pdf"]
 image_suffixes = ["png", "jpeg", "jp2", "webp", "gif", "bmp", "jpg", "tiff"]
-docx_suffixes = ["docx"]
-pptx_suffixes = ["pptx"]
-xlsx_suffixes = ["xlsx"]
-office_suffixes = docx_suffixes + pptx_suffixes + xlsx_suffixes
+# v2.7.4-fix: office parsing is out of scope; keep empty lists for gradio imports.
+docx_suffixes: list[str] = []
+pptx_suffixes: list[str] = []
+xlsx_suffixes: list[str] = []
+office_suffixes: list[str] = []
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # Maximum UTF-8 byte length allowed for task stems used in filenames.
@@ -131,7 +130,7 @@ def read_fn(path, file_suffix: str | None = None):
             file_suffix = guess_suffix_by_bytes(file_bytes, path)
         if file_suffix in image_suffixes:
             return images_bytes_to_pdf_bytes(file_bytes)
-        elif file_suffix in pdf_suffixes + office_suffixes:
+        elif file_suffix in pdf_suffixes:
             return file_bytes
         else:
             raise Exception(f"Unknown file suffix: {file_suffix}")
@@ -196,8 +195,6 @@ def _process_output(
         make_func = pipeline_union_make
     elif process_mode == "vlm":
         make_func = vlm_union_make
-    elif process_mode in office_suffixes:
-        make_func = office_union_make
     else:
         raise Exception(f"Unknown process_mode: {process_mode}")
     """处理输出文件"""
@@ -214,16 +211,10 @@ def _process_output(
             logger.warning(f"Skipping span bbox visualization for {pdf_file_name}: {exc}")
 
     if f_dump_orig_pdf:
-        if process_mode in ["pipeline", "vlm"]:
-            md_writer.write(
-                f"{pdf_file_name}_origin.pdf",
-                pdf_bytes,
-            )
-        elif process_mode in office_suffixes:
-            md_writer.write(
-                f"{pdf_file_name}_origin.{process_mode}",
-                pdf_bytes,
-            )
+        md_writer.write(
+            f"{pdf_file_name}_origin.pdf",
+            pdf_bytes,
+        )
 
     image_dir = str(os.path.basename(local_image_dir))
 
@@ -241,12 +232,12 @@ def _process_output(
             f"{pdf_file_name}_content_list.json",
             json.dumps(content_list, ensure_ascii=False, indent=4),
         )
-
-        content_list_v2 = make_func(pdf_info, MakeMode.CONTENT_LIST_V2, image_dir)
-        md_writer.write_string(
-            f"{pdf_file_name}_content_list_v2.json",
-            json.dumps(content_list_v2, ensure_ascii=False, indent=4),
-        )
+        if process_mode != "pipeline":
+            content_list_v2 = make_func(pdf_info, MakeMode.CONTENT_LIST_V2, image_dir)
+            md_writer.write_string(
+                f"{pdf_file_name}_content_list_v2.json",
+                json.dumps(content_list_v2, ensure_ascii=False, indent=4),
+            )
 
 
     if f_dump_middle_json:
@@ -525,52 +516,6 @@ async def _async_process_hybrid(
         )
 
 
-def _process_office_doc(
-        output_dir,
-        pdf_file_names: list[str],
-        pdf_bytes_list: list[bytes],
-        f_dump_md=True,
-        f_dump_middle_json=True,
-        f_dump_model_output=True,
-        f_dump_orig_file=True,
-        f_dump_content_list=True,
-        f_make_md_mode=MakeMode.MM_MD,
-):
-    need_remove_index = []
-    for i, file_bytes in enumerate(pdf_bytes_list):
-        pdf_file_name = pdf_file_names[i]
-        file_suffix = guess_suffix_by_bytes(file_bytes)
-        if file_suffix in docx_suffixes:
-
-            need_remove_index.append(i)
-
-            local_image_dir, local_md_dir = prepare_env(output_dir, pdf_file_name, f"office")
-            image_writer, md_writer = FileBasedDataWriter(local_image_dir), FileBasedDataWriter(local_md_dir)
-            middle_json, infer_result = office_docx_analyze(
-                file_bytes,
-                image_writer=image_writer,
-            )
-
-            f_draw_layout_bbox = False
-            f_draw_span_bbox = False
-            pdf_info = middle_json["pdf_info"]
-
-            _process_output(
-                pdf_info, file_bytes, pdf_file_name, local_md_dir, local_image_dir,
-                md_writer, f_draw_layout_bbox, f_draw_span_bbox, f_dump_orig_file,
-                f_dump_md, f_dump_content_list, f_dump_middle_json, f_dump_model_output,
-                f_make_md_mode, middle_json, infer_result, process_mode="docx"
-            )
-        elif file_suffix in pptx_suffixes:
-            need_remove_index.append(i)
-            logger.warning(f"Currently, PPTX files are not supported: {pdf_file_name}")
-        elif file_suffix in xlsx_suffixes:
-            need_remove_index.append(i)
-            logger.warning(f"Currently, XLSX files are not supported: {pdf_file_name}")
-
-    return need_remove_index
-
-
 def do_parse(
         output_dir,
         pdf_file_names: list[str],
@@ -593,26 +538,10 @@ def do_parse(
         end_page_id=None,
         **kwargs,
 ):
-    need_remove_index = _process_office_doc(
-        output_dir,
-        pdf_file_names=pdf_file_names,
-        pdf_bytes_list=pdf_bytes_list,
-        f_dump_md=f_dump_md,
-        f_dump_middle_json=f_dump_middle_json,
-        f_dump_model_output=f_dump_model_output,
-        f_dump_orig_file=f_dump_orig_pdf,
-        f_dump_content_list=f_dump_content_list,
-        f_make_md_mode=f_make_md_mode,
-    )
-    for index in sorted(need_remove_index, reverse=True):
-        del pdf_bytes_list[index]
-        del pdf_file_names[index]
-        del p_lang_list[index]
     if not pdf_bytes_list:
         logger.warning("No valid PDF or image files to process.")
         return
 
-    # 预处理PDF字节数据
     pdf_bytes_list = _prepare_pdf_bytes(pdf_bytes_list, start_page_id, end_page_id)
 
     if backend == "pipeline":
@@ -684,26 +613,10 @@ async def aio_do_parse(
         end_page_id=None,
         **kwargs,
 ):
-    need_remove_index = _process_office_doc(
-        output_dir,
-        pdf_file_names=pdf_file_names,
-        pdf_bytes_list=pdf_bytes_list,
-        f_dump_md=f_dump_md,
-        f_dump_middle_json=f_dump_middle_json,
-        f_dump_model_output=f_dump_model_output,
-        f_dump_orig_file=f_dump_orig_pdf,
-        f_dump_content_list=f_dump_content_list,
-        f_make_md_mode=f_make_md_mode,
-    )
-    for index in sorted(need_remove_index, reverse=True):
-        del pdf_bytes_list[index]
-        del pdf_file_names[index]
-        del p_lang_list[index]
     if not pdf_bytes_list:
         logger.warning("No valid PDF or image files to process.")
         return
 
-    # 预处理PDF字节数据
     pdf_bytes_list = _prepare_pdf_bytes(pdf_bytes_list, start_page_id, end_page_id)
 
     if backend == "pipeline":
