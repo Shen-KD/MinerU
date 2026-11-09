@@ -49,6 +49,7 @@ from mineru.cli.public_http_client_policy import (
     validate_public_http_client_request,
     warn_if_public_http_client_policy as _warn_if_public_http_client_policy,
 )
+from mineru.cli.router_healthz import healthz_heartbeat_loop
 from mineru.cli.vlm_preload import build_local_api_cli_args
 from mineru.version import __version__
 
@@ -1011,9 +1012,20 @@ async def startup_router_state(app: FastAPI, settings: RouterSettings) -> None:
     app.state.http_client = http_client
     app.state.worker_pool = worker_pool
     app.state.router_task_registry = registry
+    # 心跳挂在主事件循环上：loop 繁忙时短暂停跳可被 /healthz 宽限，
+    # loop 真死锁时心跳停止，liveness 探活失败触发重启。
+    app.state.healthz_heartbeat_task = asyncio.create_task(
+        healthz_heartbeat_loop(), name="mineru-router-healthz-heartbeat"
+    )
 
 
 async def shutdown_router_state(app: FastAPI) -> None:
+    heartbeat_task = getattr(app.state, "healthz_heartbeat_task", None)
+    if heartbeat_task is not None:
+        heartbeat_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat_task
+        app.state.healthz_heartbeat_task = None
     registry = getattr(app.state, "router_task_registry", None)
     worker_pool = getattr(app.state, "worker_pool", None)
     http_client = getattr(app.state, "http_client", None)
