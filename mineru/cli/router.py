@@ -19,7 +19,6 @@ import click
 import httpx
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from loguru import logger
 from starlette.background import BackgroundTask
@@ -50,6 +49,7 @@ from mineru.cli.public_http_client_policy import (
     warn_if_public_http_client_policy as _warn_if_public_http_client_policy,
 )
 from mineru.cli.router_healthz import healthz_heartbeat_loop
+from mineru.cli.selective_gzip import SelectiveGZipMiddleware
 from mineru.cli.vlm_preload import build_local_api_cli_args
 from mineru.version import __version__
 
@@ -1474,7 +1474,9 @@ def create_app(settings: RouterSettings | None = None) -> FastAPI:
             default=False,
         ),
     )
-    app.add_middleware(GZipMiddleware, minimum_size=1000)
+    # 只压缩 JSON/文本类响应（level=1），zip 结果流透传，
+    # 避免 compresslevel=9 压缩不可压缩内容时在事件循环上白烧 CPU
+    app.add_middleware(SelectiveGZipMiddleware, minimum_size=1000, compresslevel=1)
 
     @app.post(
         path="/tasks",

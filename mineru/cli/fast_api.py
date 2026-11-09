@@ -25,7 +25,6 @@ from fastapi import (
     Request,
     UploadFile,
 )
-from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from loguru import logger
 
@@ -55,6 +54,7 @@ from mineru.cli.api_protocol import (
     DEFAULT_PROCESSING_WINDOW_SIZE,
 )
 from mineru.cli.backend_options import DEFAULT_HYBRID_EFFORT
+from mineru.cli.selective_gzip import SelectiveGZipMiddleware
 from mineru.cli.vlm_preload import (
     maybe_preload_vlm_model,
     split_service_and_model_config,
@@ -235,7 +235,9 @@ def create_app():
     if is_main_multiprocessing_process():
         logger.info(f"Request concurrency limited to {max_concurrent_requests}")
 
-    app.add_middleware(GZipMiddleware, minimum_size=1000)
+    # 只压缩 JSON/文本类响应（level=1），zip 结果流透传，
+    # 避免 compresslevel=9 压缩不可压缩内容时在事件循环上白烧 CPU
+    app.add_middleware(SelectiveGZipMiddleware, minimum_size=1000, compresslevel=1)
     app.state.public_bind_exposed = env_flag_enabled(
         MINERU_API_PUBLIC_BIND_EXPOSED_ENV,
         default=False,
