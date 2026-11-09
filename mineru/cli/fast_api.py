@@ -84,6 +84,8 @@ SUPPORTED_UPLOAD_SUFFIXES = pdf_suffixes + image_suffixes + office_suffixes
 RESULT_IMAGE_SUFFIXES = set(image_suffixes) | {"svg"}
 DEFAULT_TASK_RETENTION_SECONDS = 24 * 60 * 60
 DEFAULT_TASK_CLEANUP_INTERVAL_SECONDS = 5 * 60
+# 队列背压：pending 任务数达到上限后新提交返回 429；0 表示不限（旧行为）
+DEFAULT_MAX_QUEUED_TASKS = 100
 DEFAULT_OUTPUT_ROOT = "./output"
 FILE_PARSE_TASK_ID_HEADER = "X-MinerU-Task-Id"
 FILE_PARSE_TASK_STATUS_HEADER = "X-MinerU-Task-Status"
@@ -198,6 +200,17 @@ class AsyncParseTask:
 
 class TaskWaitAbortedError(RuntimeError):
     """Raised when a synchronous file_parse request cannot keep waiting safely."""
+
+
+class TaskQueueFullError(RuntimeError):
+    """pending 队列达到 MINERU_API_MAX_QUEUED_TASKS 时拒绝新任务。"""
+
+    def __init__(self, max_queued_tasks: int, queued_tasks: int):
+        self.max_queued_tasks = max_queued_tasks
+        self.queued_tasks = queued_tasks
+        super().__init__(
+            f"Too many queued tasks: {queued_tasks} >= {max_queued_tasks}"
+        )
 
 
 @asynccontextmanager
@@ -333,6 +346,15 @@ def get_task_cleanup_interval_seconds() -> int:
         "MINERU_API_TASK_CLEANUP_INTERVAL_SECONDS",
         DEFAULT_TASK_CLEANUP_INTERVAL_SECONDS,
         minimum=1,
+    )
+
+
+def get_max_queued_tasks() -> int:
+    """pending 任务队列上限；0 表示不限（保持旧行为）。"""
+    return get_int_env(
+        "MINERU_API_MAX_QUEUED_TASKS",
+        DEFAULT_MAX_QUEUED_TASKS,
+        minimum=0,
     )
 
 
@@ -925,6 +947,19 @@ async def create_async_parse_task(
         raise
 
 
+def build_queue_full_response(exc: TaskQueueFullError) -> JSONResponse:
+    """统一的 429 响应：携带 Retry-After 供客户端/router 退避。"""
+    return JSONResponse(
+        status_code=429,
+        headers={"Retry-After": "5"},
+        content={
+            "message": "Too many queued tasks, please retry later",
+            "max_queued_tasks": exc.max_queued_tasks,
+            "queued_tasks": exc.queued_tasks,
+        },
+    )
+
+
 class AsyncTaskManager:
     def __init__(self, fastapi_app: FastAPI):
         self.app = fastapi_app
@@ -938,6 +973,7 @@ class AsyncTaskManager:
         self.is_shutting_down = False
         self.task_retention_seconds = get_task_retention_seconds()
         self.task_cleanup_interval_seconds = get_task_cleanup_interval_seconds()
+        self.max_queued_tasks = get_max_queued_tasks()
         self.manager_wakeup = asyncio.Event()
         self._next_submit_order = 1
 
@@ -979,6 +1015,11 @@ class AsyncTaskManager:
         self.active_tasks.clear()
 
     async def submit(self, task: AsyncParseTask) -> None:
+        if (
+            self.max_queued_tasks > 0
+            and self.queue.qsize() >= self.max_queued_tasks
+        ):
+            raise TaskQueueFullError(self.max_queued_tasks, self.queue.qsize())
         task.submit_order = self._next_submit_order
         self._next_submit_order += 1
         self.tasks[task.task_id] = task
@@ -1243,7 +1284,10 @@ async def parse_pdf(
         ParseRequestOptions, Depends(parse_request_form)
     ],
 ):
-    task = await create_async_parse_task(request_options)
+    try:
+        task = await create_async_parse_task(request_options)
+    except TaskQueueFullError as exc:
+        return build_queue_full_response(exc)
     request_options = None
     task_manager = get_task_manager()
 
@@ -1291,7 +1335,10 @@ async def submit_parse_task(
     ],
 ):
     task_manager = get_task_manager()
-    task = await create_async_parse_task(request_options)
+    try:
+        task = await create_async_parse_task(request_options)
+    except TaskQueueFullError as exc:
+        return build_queue_full_response(exc)
     return build_task_submission_response(task, http_request, task_manager)
 
 

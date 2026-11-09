@@ -1057,6 +1057,14 @@ class UpstreamSubmissionRejected(RuntimeError):
         super().__init__(detail)
 
 
+class UpstreamSubmissionBusy(UpstreamSubmissionUnavailable):
+    """上游队列已满（429）：换下一个 worker；全员满载时向客户端返回 429。"""
+
+    def __init__(self, detail: str, retry_after: str | None = None):
+        self.retry_after = retry_after
+        super().__init__(detail)
+
+
 def build_upload_destination(upload_dir: str, filename: str) -> Path:
     destination = Path(upload_dir) / filename
     if not destination.exists():
@@ -1178,6 +1186,11 @@ def submit_payload_to_upstream_sync(
             return parse_submit_response(submit_response)
         except ValueError as exc:
             raise UpstreamSubmissionUnavailable(f"Invalid submit payload: {exc}") from exc
+    if response.status_code == 429:
+        raise UpstreamSubmissionBusy(
+            f"429 {response_detail(response)}",
+            retry_after=response.headers.get("retry-after"),
+        )
     if response.status_code in HTTP_RETRYABLE_STATUS_CODES:
         raise UpstreamSubmissionUnavailable(
             f"{response.status_code} {response_detail(response)}"
@@ -1210,12 +1223,21 @@ async def submit_router_task(
     registry: RouterTaskRegistry = request.app.state.router_task_registry
     attempted_servers: set[str] = set()
     last_error: str | None = None
+    last_retry_after: str | None = None
+    busy_attempts = 0
 
     while True:
         server = await worker_pool.acquire_submission_server(excluded_server_ids=attempted_servers)
         if server is None:
             if last_error is None:
                 raise HTTPException(status_code=503, detail="No healthy upstream MinerU API servers are available")
+            if busy_attempts and busy_attempts == len(attempted_servers):
+                # 所有尝试过的上游都是 429：向客户端返回 429 而非 503
+                raise HTTPException(
+                    status_code=429,
+                    detail=last_error,
+                    headers={"Retry-After": last_retry_after or "5"},
+                )
             raise HTTPException(status_code=503, detail=last_error)
 
         try:
@@ -1244,7 +1266,13 @@ async def submit_router_task(
         except UpstreamSubmissionUnavailable as exc:
             attempted_servers.add(server.server_id)
             last_error = f"Failed to submit task via {server.server_id}: {exc}"
-            await worker_pool.mark_submission_failure(server.server_id, str(exc))
+            if isinstance(exc, UpstreamSubmissionBusy):
+                busy_attempts += 1
+                if exc.retry_after:
+                    last_retry_after = exc.retry_after
+                # 429 是过载而非故障：不标不健康，靠 score 自然避开
+            else:
+                await worker_pool.mark_submission_failure(server.server_id, str(exc))
         finally:
             await worker_pool.release_submission_server(server.server_id)
 
