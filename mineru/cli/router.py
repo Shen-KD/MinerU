@@ -345,6 +345,10 @@ class MultipartPayload:
     def cleanup(self) -> None:
         cleanup_path(self.temp_dir)
 
+    async def acleanup(self) -> None:
+        """异步清理：rmtree 大目录时不再阻塞事件循环。"""
+        await asyncio.to_thread(cleanup_path, self.temp_dir)
+
     def get_field_value(self, name: str) -> Optional[str]:
         for key, value in reversed(self.fields):
             if key == name:
@@ -1080,12 +1084,16 @@ async def stage_multipart_request(request: Request) -> MultipartPayload:
                 original_name = value.filename or f"upload-{uuid.uuid4()}"
                 filename = normalize_upload_filename(original_name)
                 destination = build_upload_destination(temp_dir, filename)
-                with open(destination, "wb") as handle:
+                # 写盘放到线程，避免同步 write 在长文件上传时占住事件循环
+                handle = await asyncio.to_thread(open, destination, "wb")
+                try:
                     while True:
                         chunk = await value.read(1 << 20)
                         if not chunk:
                             break
-                        handle.write(chunk)
+                        await asyncio.to_thread(handle.write, chunk)
+                finally:
+                    await asyncio.to_thread(handle.close)
                 uploads.append(
                     StagedUpload(
                         field_name=key,
@@ -1488,7 +1496,7 @@ def create_app(settings: RouterSettings | None = None) -> FastAPI:
         try:
             router_task = await submit_router_task(http_request, payload)
         finally:
-            payload.cleanup()
+            await payload.acleanup()
         response_payload = router_task.to_status_payload(http_request)
         response_payload["message"] = "Task submitted successfully"
         return JSONResponse(status_code=202, content=response_payload)
@@ -1549,7 +1557,7 @@ def create_app(settings: RouterSettings | None = None) -> FastAPI:
         try:
             router_task = await submit_router_task(request, payload)
         finally:
-            payload.cleanup()
+            await payload.acleanup()
 
         router_task = await wait_for_router_task_terminal_state(request, router_task)
         if router_task.status == TASK_FAILED:
