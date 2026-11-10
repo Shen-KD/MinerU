@@ -41,7 +41,9 @@ Usage: mineru-api [OPTIONS]
 Options:
   --host TEXT     Server host (default: 127.0.0.1)
   --port INTEGER  Server port (default: 8000)
-  --reload        Enable auto-reload (development mode)
+  --workers INTEGER
+                  Number of API-only FastAPI workers (default: 1)
+  --reload        Enable auto-reload (development mode; requires --workers=1)
   --enable-vlm-preload BOOLEAN
                   Preload the local VLM model during mineru-api startup.
   --help          Show this message and exit.
@@ -156,6 +158,14 @@ Here are the environment variables and their descriptions:
 - `MINERU_API_OUTPUT_ROOT`:
     * Used to configure the root output directory for `mineru-api`.
     * Default is `./output` under the current working directory.
+
+- `MINERU_API_TASK_DB_PATH`:
+    * Used to configure the SQLite queue shared by API-only FastAPI workers and the separate parser process.
+    * Default is `tasks.sqlite3` under `MINERU_API_OUTPUT_ROOT`. All processes in one worker container must use the same path.
+
+- `MINERU_API_WORKERS`:
+    * Environment equivalent of `mineru-api --workers`; it controls only API request handling, not parsing concurrency.
+    * Parsing concurrency is controlled independently by `MINERU_API_MAX_CONCURRENT_REQUESTS`.
 
 - `MINERU_LOCAL_API_STARTUP_TIMEOUT_SECONDS`:
     * Used to control how long CLI tools wait for a locally started `mineru-api` to become healthy.

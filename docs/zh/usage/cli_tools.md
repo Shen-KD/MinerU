@@ -39,7 +39,9 @@ Usage: mineru-api [OPTIONS]
 Options:
   --host TEXT     服务器主机地址（默认：127.0.0.1）
   --port INTEGER  服务器端口（默认：8000）
-  --reload        启用自动重载（开发模式）
+  --workers INTEGER
+                  仅处理 API 请求的 FastAPI worker 数（默认：1）
+  --reload        启用自动重载（开发模式，需保持 --workers=1）
   --enable-vlm-preload BOOLEAN
                   在 mineru-api 启动阶段预加载本地 VLM 模型
   --help          显示此帮助信息并退出
@@ -148,6 +150,14 @@ MinerU命令行工具的某些参数存在相同功能的环境变量配置，�
 - `MINERU_API_OUTPUT_ROOT`：
     * 用于指定 `mineru-api` 输出目录根路径
     * 默认为当前工作目录下的 `./output`。
+
+- `MINERU_API_TASK_DB_PATH`：
+    * 用于设置 API 接入进程与独立解析进程共享的 SQLite 队列路径
+    * 默认为 `MINERU_API_OUTPUT_ROOT` 下的 `tasks.sqlite3`，同一 worker 容器内所有进程必须使用相同路径。
+
+- `MINERU_API_WORKERS`：
+    * 等价于 `mineru-api --workers`，仅控制 API 请求处理进程数，不控制解析并发。
+    * 解析并发仍由 `MINERU_API_MAX_CONCURRENT_REQUESTS` 独立控制。
 
 - `MINERU_LOCAL_API_STARTUP_TIMEOUT_SECONDS`：
     * 用于控制各命令行工具等待本地拉起的 `mineru-api` 进入健康状态的最长时间

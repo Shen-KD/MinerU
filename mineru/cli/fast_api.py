@@ -43,6 +43,8 @@ from mineru.cli.common import (
     uniquify_task_stems,
 )
 from mineru.cli.api_request import ParseRequestOptions, parse_request_form
+from mineru.cli.api_task import AsyncParseTask, StoredUpload
+from mineru.cli.task_manager import AsyncTaskManager, TaskWaitAbortedError
 from mineru.cli.public_http_client_policy import (
     configure_public_http_client_policy,
     is_public_bind_host,
@@ -131,75 +133,6 @@ def install_stdin_shutdown_watcher(server: uvicorn.Server) -> None:
     watcher.start()
 
 
-@dataclass
-class StoredUpload:
-    original_name: str
-    stem: str
-    path: str
-
-
-@dataclass
-class AsyncParseTask:
-    task_id: str
-    status: str
-    backend: str
-    file_names: list[str]
-    created_at: str
-    output_dir: str
-    effort: str
-    parse_method: str
-    lang_list: list[str]
-    formula_enable: bool
-    table_enable: bool
-    image_analysis: bool
-    server_url: Optional[str]
-    return_md: bool
-    return_middle_json: bool
-    return_model_output: bool
-    return_content_list: bool
-    return_images: bool
-    response_format_zip: bool
-    return_original_file: bool
-    client_side_output_generation: bool
-    start_page_id: int
-    end_page_id: int
-    upload_names: list[str]
-    uploads: list[str]
-    submit_order: int = 0
-    started_at: Optional[str] = None
-    completed_at: Optional[str] = None
-    error: Optional[str] = None
-
-    def to_status_payload(
-        self,
-        request: Request,
-        queued_ahead: int | None = None,
-    ) -> dict[str, Any]:
-        payload = {
-            "task_id": self.task_id,
-            "status": self.status,
-            "backend": self.backend,
-            "file_names": self.file_names,
-            "created_at": self.created_at,
-            "started_at": self.started_at,
-            "completed_at": self.completed_at,
-            "error": self.error,
-            "status_url": str(
-                request.url_for("get_async_task_status", task_id=self.task_id)
-            ),
-            "result_url": str(
-                request.url_for("get_async_task_result", task_id=self.task_id)
-            ),
-        }
-        if queued_ahead is not None:
-            payload["queued_ahead"] = queued_ahead
-        return payload
-
-
-class TaskWaitAbortedError(RuntimeError):
-    """Raised when a synchronous file_parse request cannot keep waiting safely."""
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await startup_app_state(app)
@@ -261,16 +194,17 @@ def create_app():
 app = create_app()
 
 
-async def startup_app_state(app: FastAPI) -> "AsyncTaskManager":
-    task_manager = AsyncTaskManager(app)
+async def startup_app_state(app: FastAPI, enable_parsing: bool = False) -> "AsyncTaskManager":
+    task_manager = AsyncTaskManager(app, enable_parsing=enable_parsing)
     await task_manager.start()
     try:
-        service_config = getattr(app.state, "service_config", {})
-        model_config = getattr(app.state, "config", {})
-        maybe_preload_vlm_model(
-            bool(service_config.get("enable_vlm_preload", False)),
-            model_kwargs=model_config,
-        )
+        if enable_parsing:
+            service_config = getattr(app.state, "service_config", {})
+            model_config = getattr(app.state, "config", {})
+            maybe_preload_vlm_model(
+                bool(service_config.get("enable_vlm_preload", False)),
+                model_kwargs=model_config,
+            )
     except Exception:
         await task_manager.shutdown()
         app.state.task_manager = None
@@ -923,301 +857,6 @@ async def create_async_parse_task(
         raise
 
 
-class AsyncTaskManager:
-    def __init__(self, fastapi_app: FastAPI):
-        self.app = fastapi_app
-        self.tasks: dict[str, AsyncParseTask] = {}
-        self.task_events: dict[str, asyncio.Event] = {}
-        self.queue: asyncio.Queue[str] = asyncio.Queue()
-        self.dispatcher_task: Optional[asyncio.Task[Any]] = None
-        self.cleanup_task: Optional[asyncio.Task[Any]] = None
-        self.active_tasks: set[asyncio.Task[Any]] = set()
-        self.last_worker_error: Optional[str] = None
-        self.is_shutting_down = False
-        self.task_retention_seconds = get_task_retention_seconds()
-        self.task_cleanup_interval_seconds = get_task_cleanup_interval_seconds()
-        self.manager_wakeup = asyncio.Event()
-        self._next_submit_order = 1
-
-    async def start(self) -> None:
-        self.is_shutting_down = False
-        self.last_worker_error = None
-        self.manager_wakeup = asyncio.Event()
-        if self.dispatcher_task is None or self.dispatcher_task.done():
-            self.dispatcher_task = asyncio.create_task(
-                self._dispatcher_loop(), name="mineru-fastapi-task-dispatcher"
-            )
-        if (
-            self.task_retention_seconds > 0
-            and (self.cleanup_task is None or self.cleanup_task.done())
-        ):
-            self.cleanup_task = asyncio.create_task(
-                self._cleanup_loop(), name="mineru-fastapi-task-cleanup"
-            )
-
-    async def shutdown(self) -> None:
-        self.is_shutting_down = True
-        self._wake_waiters()
-        if self.dispatcher_task is not None:
-            self.dispatcher_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self.dispatcher_task
-            self.dispatcher_task = None
-        if self.cleanup_task is not None:
-            self.cleanup_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self.cleanup_task
-            self.cleanup_task = None
-
-        pending = list(self.active_tasks)
-        for processor in pending:
-            processor.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-        self.active_tasks.clear()
-
-    async def submit(self, task: AsyncParseTask) -> None:
-        task.submit_order = self._next_submit_order
-        self._next_submit_order += 1
-        self.tasks[task.task_id] = task
-        self.task_events[task.task_id] = asyncio.Event()
-        await self.queue.put(task.task_id)
-
-    def get(self, task_id: str) -> Optional[AsyncParseTask]:
-        return self.tasks.get(task_id)
-
-    def get_queued_ahead(self, task_id: str) -> int | None:
-        task = self.tasks.get(task_id)
-        if task is None:
-            return None
-        if task.status != TASK_PENDING:
-            return 0
-
-        return sum(
-            1
-            for other_task in self.tasks.values()
-            if (
-                other_task.task_id != task_id
-                and other_task.status == TASK_PENDING
-                and 0 < other_task.submit_order < task.submit_order
-            )
-        )
-
-    def build_status_payload(
-        self,
-        task: AsyncParseTask,
-        request: Request,
-    ) -> dict[str, Any]:
-        return task.to_status_payload(
-            request,
-            queued_ahead=self.get_queued_ahead(task.task_id),
-        )
-
-    async def wait_for_terminal_state(self, task_id: str) -> AsyncParseTask:
-        task = self.tasks.get(task_id)
-        if task is None:
-            raise TaskWaitAbortedError("Task not found")
-        if is_task_terminal(task.status):
-            return task
-
-        task_event = self.task_events.get(task_id)
-        if task_event is None:
-            raise TaskWaitAbortedError("Task wait handle is unavailable")
-
-        event_wait_task = asyncio.create_task(task_event.wait())
-        manager_wait_task = asyncio.create_task(self.manager_wakeup.wait())
-        done: set[asyncio.Task[Any]] = set()
-        pending: set[asyncio.Task[Any]] = set()
-        try:
-            done, pending = await asyncio.wait(
-                {event_wait_task, manager_wait_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-        finally:
-            for waiter in pending:
-                waiter.cancel()
-            if pending:
-                await asyncio.gather(*pending, return_exceptions=True)
-            for waiter in done:
-                with suppress(asyncio.CancelledError):
-                    waiter.result()
-
-        task = self.tasks.get(task_id)
-        if task is None:
-            if self.is_shutting_down:
-                raise TaskWaitAbortedError("Task manager is shutting down")
-            raise TaskWaitAbortedError("Task was removed before completion")
-        if is_task_terminal(task.status):
-            return task
-        if self.is_shutting_down:
-            raise TaskWaitAbortedError("Task manager is shutting down")
-        raise TaskWaitAbortedError(
-            self.last_worker_error or "Task manager became unavailable while waiting"
-        )
-
-    def get_stats(self) -> dict[str, int]:
-        stats = {
-            TASK_PENDING: 0,
-            TASK_PROCESSING: 0,
-            TASK_COMPLETED: 0,
-            TASK_FAILED: 0,
-        }
-        for task in self.tasks.values():
-            if task.status in stats:
-                stats[task.status] += 1
-        return stats
-
-    def is_healthy(self) -> bool:
-        if self.dispatcher_task is None:
-            return False
-        if self.dispatcher_task.done() and not self.is_shutting_down:
-            return False
-        if self.task_retention_seconds > 0 and self.cleanup_task is None:
-            return False
-        if (
-            self.task_retention_seconds > 0
-            and self.cleanup_task is not None
-            and self.cleanup_task.done()
-            and not self.is_shutting_down
-        ):
-            return False
-        return self.last_worker_error is None
-
-    def _wake_waiters(self) -> None:
-        self.manager_wakeup.set()
-        for task_event in self.task_events.values():
-            task_event.set()
-
-    def _signal_task_event(self, task_id: str) -> None:
-        task_event = self.task_events.get(task_id)
-        if task_event is not None:
-            task_event.set()
-
-    async def _dispatcher_loop(self) -> None:
-        try:
-            while True:
-                task_id = await self.queue.get()
-                processor = asyncio.create_task(
-                    self._process_task(task_id),
-                    name=f"mineru-fastapi-task-{task_id}",
-                )
-                self.active_tasks.add(processor)
-                processor.add_done_callback(self._on_processor_done)
-                self.queue.task_done()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            self.last_worker_error = str(exc)
-            self._wake_waiters()
-            logger.exception("Async task dispatcher crashed")
-            raise
-
-    async def _cleanup_loop(self) -> None:
-        try:
-            while True:
-                await asyncio.sleep(self.task_cleanup_interval_seconds)
-                self.cleanup_expired_tasks()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            self.last_worker_error = str(exc)
-            logger.exception("Async task cleanup loop crashed")
-            raise
-
-    def _on_processor_done(self, processor: asyncio.Task[Any]) -> None:
-        self.active_tasks.discard(processor)
-        if processor.cancelled():
-            return
-        exception = processor.exception()
-        if exception is not None:
-            logger.error(f"Async task processor crashed: {exception}")
-            self.last_worker_error = str(exception)
-
-    async def _process_task(self, task_id: str) -> None:
-        task = self.tasks.get(task_id)
-        if task is None:
-            return
-
-        try:
-            if _request_semaphore is not None:
-                async with _request_semaphore:
-                    await self._run_task(task)
-            else:
-                await self._run_task(task)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            task.status = TASK_FAILED
-            task.error = str(exc)
-            task.completed_at = utc_now_iso()
-            self._signal_task_event(task_id)
-            logger.exception(f"Async task failed: {task_id}")
-
-    async def _run_task(self, task: AsyncParseTask) -> None:
-        task.status = TASK_PROCESSING
-        task.started_at = utc_now_iso()
-        task.error = None
-
-        uploads = [
-            StoredUpload(
-                original_name=upload_name,
-                stem=file_name,
-                path=upload_path,
-            )
-            for upload_name, file_name, upload_path in zip(
-                task.upload_names,
-                task.file_names,
-                task.uploads,
-            )
-        ]
-        config = getattr(self.app.state, "config", {})
-        await run_parse_job(
-            output_dir=task.output_dir,
-            uploads=uploads,
-            request_options=task,
-            config=config,
-        )
-        task.status = TASK_COMPLETED
-        task.completed_at = utc_now_iso()
-        self._signal_task_event(task.task_id)
-
-    def cleanup_expired_tasks(self) -> int:
-        if self.task_retention_seconds <= 0:
-            return 0
-
-        now = datetime.now(timezone.utc)
-        expired_task_ids = [
-            task_id
-            for task_id, task in self.tasks.items()
-            if self._is_task_expired(task, now)
-        ]
-
-        for task_id in expired_task_ids:
-            task = self.tasks.pop(task_id, None)
-            if task is None:
-                continue
-            task_event = self.task_events.pop(task_id, None)
-            if task_event is not None:
-                task_event.set()
-            cleanup_file(task.output_dir)
-            logger.info(f"Cleaned expired async task: {task_id}")
-        return len(expired_task_ids)
-
-    def _is_task_expired(self, task: AsyncParseTask, now: datetime) -> bool:
-        if task.status not in (TASK_COMPLETED, TASK_FAILED):
-            return False
-        if not task.completed_at:
-            return False
-        try:
-            completed_at = datetime.fromisoformat(task.completed_at)
-        except ValueError:
-            logger.warning(f"Invalid completed_at for task {task.task_id}: {task.completed_at}")
-            return False
-        if completed_at.tzinfo is None:
-            completed_at = completed_at.replace(tzinfo=timezone.utc)
-        return (now - completed_at).total_seconds() >= self.task_retention_seconds
-
-
 def get_task_manager() -> AsyncTaskManager:
     task_manager = getattr(app.state, "task_manager", None)
     if task_manager is None:
@@ -1392,12 +1031,28 @@ async def health_check():
     }
 
 
+async def _run_parser_process(service_config: dict[str, Any], model_config: dict[str, Any]) -> None:
+    app.state.service_config = service_config
+    app.state.config = model_config
+    await startup_app_state(app, enable_parsing=True)
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await shutdown_app_state(app)
+
+
+def run_parser_process(service_config: dict[str, Any], model_config: dict[str, Any]) -> None:
+    """Process entrypoint that owns parsing but never serves HTTP requests."""
+    asyncio.run(_run_parser_process(service_config, model_config))
+
+
 @click.command(
     context_settings=dict(ignore_unknown_options=True, allow_extra_args=True)
 )
 @click.pass_context
 @click.option("--host", default="127.0.0.1", help="Server host (default: 127.0.0.1)")
 @click.option("--port", default=8000, type=int, help="Server port (default: 8000)")
+@click.option("--workers", default=1, type=click.IntRange(min=1), envvar="MINERU_API_WORKERS", show_default=True, help="Number of API-only FastAPI worker processes")
 @click.option("--reload", is_flag=True, help="Enable auto-reload (development mode)")
 @click.option(
     "--allow-public-http-client",
@@ -1421,6 +1076,7 @@ def main(
     reload,
     allow_public_http_client,
     enable_vlm_preload,
+    workers,
     **kwargs,
 ):
     del kwargs
@@ -1449,25 +1105,30 @@ def main(
     print(f"Start MinerU FastAPI Service: http://{host}:{port}")
     print(f"API documentation: http://{host}:{port}/docs")
 
-    if reload:
+    if reload and workers != 1:
+        raise click.UsageError("--reload requires --workers=1")
+
+    parser_process = multiprocessing.get_context("spawn").Process(
+        target=run_parser_process,
+        args=(service_config, model_config),
+        name="mineru-parser",
+    )
+    parser_process.start()
+    try:
         uvicorn.run(
             "mineru.cli.fast_api:app",
             host=host,
             port=port,
-            reload=True,
+            reload=reload,
+            workers=workers,
             access_log=access_log,
         )
-    else:
-        config = uvicorn.Config(
-            app,
-            host=host,
-            port=port,
-            reload=False,
-            access_log=access_log,
-        )
-        server = uvicorn.Server(config)
-        install_stdin_shutdown_watcher(server)
-        server.run()
+    finally:
+        parser_process.terminate()
+        parser_process.join(timeout=30)
+        if parser_process.is_alive():
+            parser_process.kill()
+            parser_process.join(timeout=30)
 
 
 if __name__ == "__main__":
