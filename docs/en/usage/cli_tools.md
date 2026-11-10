@@ -85,7 +85,8 @@ Usage: mineru-router [OPTIONS]
 Options:
   --host TEXT             Server host (default: 127.0.0.1)
   --port INTEGER          Server port (default: 8002)
-  --reload                Enable auto-reload (development mode)
+  --workers INTEGER       Number of router API worker processes (default: 1)
+  --reload                Enable auto-reload (development mode; requires --workers=1)
   --upstream-url TEXT     Existing MinerU FastAPI base URL; repeat to add more
   --local-gpus TEXT       Local GPU workers to launch: auto, none, or CSV such
                           as 0,1,2
@@ -166,6 +167,14 @@ Here are the environment variables and their descriptions:
 - `MINERU_API_WORKERS`:
     * Environment equivalent of `mineru-api --workers`; it controls only API request handling, not parsing concurrency.
     * Parsing concurrency is controlled independently by `MINERU_API_MAX_CONCURRENT_REQUESTS`.
+
+- `MINERU_ROUTER_WORKERS`:
+    * Environment equivalent of `mineru-router --workers`, controlling the number of router API processes.
+    * Multiple workers require remote upstreams and a shared `MINERU_ROUTER_TASK_SECRET`.
+
+- `MINERU_ROUTER_TASK_SECRET`:
+    * Shared HMAC secret used by router workers and replicas to sign and verify stateless task IDs.
+    * Configure the same non-empty value on every router worker/replica. Multiple replicas use remote upstreams rather than router-managed local GPU workers.
 
 - `MINERU_LOCAL_API_STARTUP_TIMEOUT_SECONDS`:
     * Used to control how long CLI tools wait for a locally started `mineru-api` to become healthy.

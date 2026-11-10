@@ -78,7 +78,8 @@ Usage: mineru-router [OPTIONS]
 Options:
   --host TEXT             路由服务主机地址（默认：127.0.0.1）
   --port INTEGER          路由服务端口（默认：8002）
-  --reload                启用自动重载（开发模式）
+  --workers INTEGER       路由 API worker 进程数（默认：1）
+  --reload                启用自动重载（开发模式，需保持 --workers=1）
   --upstream-url TEXT     现有 MinerU FastAPI 服务地址；可重复传入多个
   --local-gpus TEXT       本地 GPU worker 配置：auto、none 或 0,1,2 形式
   --worker-host TEXT      路由托管 worker 的监听地址（默认：127.0.0.1）
@@ -158,6 +159,14 @@ MinerU命令行工具的某些参数存在相同功能的环境变量配置，�
 - `MINERU_API_WORKERS`：
     * 等价于 `mineru-api --workers`，仅控制 API 请求处理进程数，不控制解析并发。
     * 解析并发仍由 `MINERU_API_MAX_CONCURRENT_REQUESTS` 独立控制。
+
+- `MINERU_ROUTER_WORKERS`：
+    * 等价于 `mineru-router --workers`，控制路由 API 进程数。
+    * 多 worker 需要使用远程 upstream，并配置相同的 `MINERU_ROUTER_TASK_SECRET`。
+
+- `MINERU_ROUTER_TASK_SECRET`：
+    * 路由 worker/副本用于签名和验证无状态任务 ID 的共享 HMAC 密钥。
+    * 所有路由 worker/副本必须配置相同的非空值；多副本场景使用远程 upstream，不使用 router 托管的本地 GPU worker。
 
 - `MINERU_LOCAL_API_STARTUP_TIMEOUT_SECONDS`：
     * 用于控制各命令行工具等待本地拉起的 `mineru-api` 进入健康状态的最长时间

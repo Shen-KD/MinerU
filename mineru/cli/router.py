@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import random
+import secrets
 import shutil
 import socket
 import subprocess
@@ -43,6 +44,7 @@ from mineru.cli.api_client import (
 from mineru.cli.api_protocol import API_PROTOCOL_VERSION
 from mineru.cli.api_request import ParseRequestOptions, parse_request_form
 from mineru.cli.common import normalize_upload_filename
+from mineru.cli.router_task_token import decode_task_token, encode_task_token
 from mineru.cli.public_http_client_policy import (
     configure_public_http_client_policy,
     is_public_bind_host,
@@ -310,6 +312,7 @@ class RouterSettings:
     task_retention_seconds: int = DEFAULT_TASK_RETENTION_SECONDS
     task_cleanup_interval_seconds: int = DEFAULT_TASK_CLEANUP_INTERVAL_SECONDS
     worker_refresh_interval_seconds: float = WORKER_REFRESH_INTERVAL_SECONDS
+    task_secret: str = ""
 
     @classmethod
     def from_env(cls) -> "RouterSettings":
@@ -324,6 +327,7 @@ class RouterSettings:
             worker_extra_args=parse_json_env("MINERU_ROUTER_WORKER_ARGS_JSON"),
             task_retention_seconds=get_task_retention_seconds(),
             task_cleanup_interval_seconds=get_task_cleanup_interval_seconds(),
+            task_secret=os.getenv("MINERU_ROUTER_TASK_SECRET", ""),
         )
 
 
@@ -835,9 +839,11 @@ class RouterTaskRegistry:
         *,
         task_retention_seconds: int,
         cleanup_interval_seconds: int,
+        task_secret: str = "",
     ):
         self.task_retention_seconds = task_retention_seconds
         self.cleanup_interval_seconds = cleanup_interval_seconds
+        self.task_secret = task_secret or secrets.token_urlsafe(32)
         self._tasks: dict[str, RouterTaskRecord] = {}
         self._lock = asyncio.Lock()
         self._cleanup_task: asyncio.Task[Any] | None = None
@@ -875,8 +881,17 @@ class RouterTaskRegistry:
         error: Optional[str],
         queued_ahead: int | None,
     ) -> RouterTaskRecord:
+        task_id = encode_task_token(
+            {
+                "s": upstream_server_id,
+                "u": upstream_base_url,
+                "t": upstream_task_id,
+                "c": created_at,
+            },
+            self.task_secret,
+        )
         task = RouterTaskRecord(
-            task_id=str(uuid.uuid4()),
+            task_id=task_id,
             upstream_server_id=upstream_server_id,
             upstream_task_id=upstream_task_id,
             upstream_base_url=upstream_base_url,
@@ -895,7 +910,26 @@ class RouterTaskRegistry:
 
     async def get(self, task_id: str) -> RouterTaskRecord | None:
         async with self._lock:
-            return self._tasks.get(task_id)
+            task = self._tasks.get(task_id)
+        if task is not None:
+            return task
+        try:
+            payload = decode_task_token(task_id, self.task_secret)
+        except ValueError:
+            return None
+        task = RouterTaskRecord(
+            task_id=task_id,
+            upstream_server_id=payload["s"],
+            upstream_task_id=payload["t"],
+            upstream_base_url=payload["u"],
+            backend="",
+            file_names=[],
+            created_at=payload["c"],
+            status=TASK_PENDING,
+        )
+        async with self._lock:
+            self._tasks[task_id] = task
+        return task
 
     async def update_from_upstream_payload(
         self,
@@ -989,6 +1023,7 @@ async def startup_router_state(app: FastAPI, settings: RouterSettings) -> None:
     registry = RouterTaskRegistry(
         task_retention_seconds=settings.task_retention_seconds,
         cleanup_interval_seconds=settings.task_cleanup_interval_seconds,
+        task_secret=settings.task_secret,
     )
 
     try:
@@ -1571,6 +1606,7 @@ app = create_app()
 @click.pass_context
 @click.option("--host", default="127.0.0.1", help="Server host (default: 127.0.0.1)")
 @click.option("--port", default=8002, type=int, help="Server port (default: 8002)")
+@click.option("--workers", default=1, type=click.IntRange(min=1), envvar="MINERU_ROUTER_WORKERS", show_default=True, help="Number of router API worker processes")
 @click.option("--reload", is_flag=True, help="Enable auto-reload (development mode)")
 @click.option(
     "--allow-public-http-client",
@@ -1613,6 +1649,7 @@ def main(
     local_gpus: str,
     worker_host: str,
     enable_vlm_preload: bool,
+    workers: int,
 ):
     settings = RouterSettings(
         upstream_urls=tuple(upstream_urls),
@@ -1622,8 +1659,16 @@ def main(
         worker_extra_args=tuple(ctx.args),
         task_retention_seconds=get_task_retention_seconds(),
         task_cleanup_interval_seconds=get_task_cleanup_interval_seconds(),
+        task_secret=os.getenv("MINERU_ROUTER_TASK_SECRET", ""),
     )
     public_bind_exposed = is_public_bind_host(host)
+    if reload and workers != 1:
+        raise click.UsageError("--reload requires --workers=1")
+    if workers > 1:
+        if not settings.task_secret:
+            raise click.UsageError("--workers>1 requires MINERU_ROUTER_TASK_SECRET")
+        if not settings.upstream_urls or parse_local_gpus(settings.local_gpus):
+            raise click.UsageError("--workers>1 requires remote --upstream-url entries and --local-gpus none")
     warn_if_router_preload_ignored(settings)
     configure_public_http_client_policy(
         app,
@@ -1637,6 +1682,7 @@ def main(
         "1" if settings.enable_vlm_preload else "0"
     )
     os.environ["MINERU_ROUTER_WORKER_ARGS_JSON"] = json.dumps(list(settings.worker_extra_args))
+    os.environ["MINERU_ROUTER_TASK_SECRET"] = settings.task_secret
     os.environ[MINERU_ROUTER_PUBLIC_BIND_EXPOSED_ENV] = (
         "1" if public_bind_exposed else "0"
     )
@@ -1649,22 +1695,12 @@ def main(
     print(f"Start MinerU Router Service: http://{host}:{port}")
     print(f"API documentation: http://{host}:{port}/docs")
 
-    if reload:
-        uvicorn.run(
-            "mineru.cli.router:app",
-            host=host,
-            port=port,
-            reload=True,
-            access_log=access_log,
-        )
-        return
-
-    configured_app = create_app(settings)
     uvicorn.run(
-        configured_app,
+        "mineru.cli.router:app",
         host=host,
         port=port,
-        reload=False,
+        reload=reload,
+        workers=workers,
         access_log=access_log,
     )
 
