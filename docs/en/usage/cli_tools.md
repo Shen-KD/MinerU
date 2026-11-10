@@ -141,6 +141,10 @@ Here are the environment variables and their descriptions:
     * Used to control the processing window size, which affects memory use and throughput on large-document workloads.
     * Default is `64`; set it to another positive integer when needed.
 
+- `MINERU_MALLOC_TRIM`:
+    * Used to opt in to best-effort glibc heap trimming after each processing window and document cleanup on Linux.
+    * Default is disabled; set it to `1`, `true`, `yes`, or `on` to enable it. This does not release objects that are still referenced.
+
 - `MINERU_API_MAX_CONCURRENT_REQUESTS`:
     * Used to control the maximum concurrent requests handled by `mineru-api` or router-managed workers.
     * Default is `3`, and it must be a positive integer.

@@ -27,6 +27,7 @@ from mineru.utils.pdf_image_tools import (
 )
 from ...utils.check_sys_env import is_mac_os_version_supported
 from ...utils.config_reader import get_device, get_processing_window_size
+from ...utils.model_utils import trim_process_heap
 
 from ...utils.enum_class import ImageType
 from ...utils.pdfium_guard import (
@@ -501,6 +502,7 @@ def doc_analyze(
                     last_append_end_time = time.time()
                 finally:
                     _close_images(images_list)
+                    trim_process_heap()
         finally:
             if progress_bar is not None:
                 progress_bar.close()
@@ -518,6 +520,7 @@ def doc_analyze(
     finally:
         if not doc_closed:
             close_pdfium_document(pdf_doc)
+        trim_process_heap()
 
 
 async def aio_doc_analyze(
@@ -600,6 +603,7 @@ async def aio_doc_analyze(
                     last_append_end_time = time.time()
                 finally:
                     _close_images(images_list)
+                    trim_process_heap()
         finally:
             if progress_bar is not None:
                 progress_bar.close()
@@ -617,3 +621,4 @@ async def aio_doc_analyze(
     finally:
         if not doc_closed:
             close_pdfium_document(pdf_doc)
+        trim_process_heap()

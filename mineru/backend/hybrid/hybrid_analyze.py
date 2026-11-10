@@ -43,7 +43,7 @@ from mineru.utils.config_reader import (
 )
 from mineru.utils.enum_class import BlockType as MineruBlockType
 from mineru.utils.enum_class import ImageType, NotExtractType
-from mineru.utils.model_utils import clean_memory, crop_img, get_vram
+from mineru.utils.model_utils import clean_memory, crop_img, get_vram, trim_process_heap
 from mineru.utils.ocr_utils import (
     get_adjusted_mfdetrec_res,
     get_ocr_result_list,
@@ -1061,6 +1061,7 @@ def doc_analyze(
                     last_append_end_time = time.time()
                 finally:
                     _close_images(images_list)
+                    trim_process_heap()
         finally:
             if progress_bar is not None:
                 progress_bar.close()
@@ -1092,6 +1093,7 @@ def doc_analyze(
     finally:
         if not doc_closed:
             close_pdfium_document(pdf_doc)
+        trim_process_heap()
 
 
 async def aio_doc_analyze(
@@ -1275,6 +1277,7 @@ async def aio_doc_analyze(
                     last_append_end_time = time.time()
                 finally:
                     _close_images(images_list)
+                    trim_process_heap()
         finally:
             if progress_bar is not None:
                 progress_bar.close()
@@ -1308,3 +1311,4 @@ async def aio_doc_analyze(
     finally:
         if not doc_closed:
             close_pdfium_document(pdf_doc)
+        trim_process_heap()

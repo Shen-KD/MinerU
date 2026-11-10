@@ -20,7 +20,7 @@ from mineru.utils.config_reader import get_device, get_processing_window_size
 from ...utils.enum_class import ImageType
 from ...utils.pdf_classify import classify
 from ...utils.pdf_image_tools import load_images_from_pdf_doc
-from ...utils.model_utils import get_vram, clean_memory
+from ...utils.model_utils import get_vram, clean_memory, trim_process_heap
 from ...utils.pdfium_guard import (
     close_pdfium_document,
     get_pdfium_document_page_count,
@@ -138,6 +138,7 @@ def _finalize_processing_window_context(
     )
     close_pdfium_document(context['pdf_doc'])
     context['closed'] = True
+    trim_process_heap()
 
 
 def _emit_zero_page_contexts(
@@ -308,6 +309,7 @@ def doc_analyze_streaming(
                     for _context, images_list, _page_start, _take_count in batch_payloads:
                         _close_images(images_list)
                         images_list.clear()
+                    trim_process_heap()
 
                 last_append_end_time = time.time()
                 processed_pages += len(batch_images)
@@ -326,6 +328,7 @@ def doc_analyze_streaming(
             if not context['closed']:
                 close_pdfium_document(context['pdf_doc'])
                 context['closed'] = True
+                trim_process_heap()
 
 
 def batch_image_analyze(

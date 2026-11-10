@@ -3,6 +3,9 @@ import math
 import os
 import time
 import gc
+import sys
+from collections.abc import Callable
+from functools import lru_cache
 from PIL import Image
 from loguru import logger
 import numpy as np
@@ -178,6 +181,34 @@ def get_res_list_from_layout_res(layout_res, overlap_threshold=0.8):
         layout_res[:] = [res for res in layout_res if id(res) not in nested_remove_ids]
 
     return ocr_res_list, table_res_list, single_page_mfdetrec_res
+
+
+@lru_cache(maxsize=1)
+def _get_malloc_trim() -> Callable[[int], int] | None:
+    """Resolve and cache the process libc malloc_trim symbol when available."""
+    try:
+        import ctypes
+
+        malloc_trim = ctypes.CDLL(None).malloc_trim
+        malloc_trim.argtypes = [ctypes.c_size_t]
+        malloc_trim.restype = ctypes.c_int
+        return malloc_trim
+    except Exception:
+        return None
+
+
+def trim_process_heap() -> bool:
+    """Best-effort return of free Linux heap pages, controlled by an explicit opt-in."""
+    if os.getenv("MINERU_MALLOC_TRIM", "").strip().lower() not in {"1", "true", "yes", "on"}:
+        return False
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        malloc_trim = _get_malloc_trim()
+        return bool(malloc_trim(0)) if malloc_trim is not None else False
+    except Exception:
+        # Optional cleanup must never mask parsing or resource-cleanup failures.
+        return False
 
 
 def clean_memory(device='cuda'):
